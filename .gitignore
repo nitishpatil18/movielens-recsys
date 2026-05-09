@@ -1,0 +1,28 @@
+# data files - too large for git
+data/
+*.csv
+*.parquet
+*.zip
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.pytest_cache/
+
+# env
+.env
+venv/
+.venv/
+
+# os / editor
+.DS_Store
+.vscode/
+.idea/
+
+# model artifacts
+*.pkl
+*.pt
+*.pth
+checkpoints/
