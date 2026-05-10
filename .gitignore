@@ -25,5 +25,4 @@ venv/
 *.pkl
 *.pt
 *.pth
-checkpoints/
 checkpoints/*.pt

@@ -1,0 +1,36 @@
+{
+  "config": {
+    "data_dir": "/Users/nitishpatil/projects/recsys/data/parquet",
+    "ckpt_dir": "/Users/nitishpatil/projects/recsys/checkpoints",
+    "emb_dim": 32,
+    "batch_size": 8192,
+    "lr": 0.005,
+    "weight_decay": 1e-05,
+    "epochs": 5,
+    "patience": 2,
+    "val_quantile": 0.9,
+    "eval_n_users": 1000,
+    "eval_like_threshold": 4.0,
+    "eval_k_list": [
+      5,
+      10,
+      20
+    ],
+    "seed": 42
+  },
+  "metrics": {
+    "val_rmse": 0.8616477044151603,
+    "best_epoch": 3,
+    "recall@5": 0.020141692174095477,
+    "recall@10": 0.034473358399022075,
+    "recall@20": 0.0520465752962904,
+    "ndcg@5": 0.07833766420735637,
+    "ndcg@10": 0.07429602879402145,
+    "ndcg@20": 0.07275499043931515,
+    "pop_recall@5": 0.020177230364597395,
+    "pop_recall@10": 0.030107608822676296,
+    "pop_recall@20": 0.04683331327569476
+  },
+  "n_users": 150330,
+  "n_movies": 45058
+}
