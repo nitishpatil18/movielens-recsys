@@ -1,0 +1,16 @@
+.git
+.gitignore
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+notebooks/
+data/
+checkpoints/*
+!checkpoints/two_tower.pt
+!checkpoints/ranker.lgb
+*.md
+.venv/
+venv/

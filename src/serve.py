@@ -43,8 +43,8 @@ faiss.omp_set_num_threads(1)
 torch.set_num_threads(1)
 
 # config
-CKPT_DIR = Path.home() / "projects" / "recsys" / "checkpoints"
-DATA_DIR = Path.home() / "projects" / "recsys" / "data" / "parquet"
+CKPT_DIR = Path(os.environ.get("RECSYS_CKPT_DIR", Path.home() / "projects" / "recsys" / "checkpoints"))
+DATA_DIR = Path(os.environ.get("RECSYS_DATA_DIR", Path.home() / "projects" / "recsys" / "data" / "parquet"))
 TWO_TOWER_CKPT = CKPT_DIR / "two_tower.pt"
 RANKER_CKPT = CKPT_DIR / "ranker.lgb"
 

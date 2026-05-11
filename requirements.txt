@@ -1,0 +1,10 @@
+# pinned to the versions tested in dev
+numpy==1.26.4
+pandas==3.0.2
+pyarrow==24.0.0
+torch==2.11.0
+faiss-cpu==1.13.2
+lightgbm==4.6.0
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+pydantic==2.13.4
