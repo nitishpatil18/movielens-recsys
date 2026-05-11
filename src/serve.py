@@ -25,6 +25,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from fastapi import Request
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -47,11 +48,44 @@ DATA_DIR = Path.home() / "projects" / "recsys" / "data" / "parquet"
 TWO_TOWER_CKPT = CKPT_DIR / "two_tower.pt"
 RANKER_CKPT = CKPT_DIR / "ranker.lgb"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
+import json as _json
+import uuid
+from contextvars import ContextVar
+
+# request-scoped state — each request gets its own context, threaded via middleware
+_request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class JSONFormatter(logging.Formatter):
+    """one json object per log line. fields: ts, level, msg, request_id, plus any 'extra' kwargs."""
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created)) + f".{int((record.created % 1)*1000):03d}",
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "request_id": _request_id_var.get(),
+        }
+        # extra fields passed via log.info("msg", extra={"key": ...})
+        for key, value in record.__dict__.items():
+            if key in ("name", "msg", "args", "levelname", "levelno", "pathname",
+                      "filename", "module", "exc_info", "exc_text", "stack_info",
+                      "lineno", "funcName", "created", "msecs", "relativeCreated",
+                      "thread", "threadName", "processName", "process", "message",
+                      "taskName"):
+                continue
+            payload[key] = value
+        return _json.dumps(payload, default=str)
+
+
+# install the json formatter on the root logger
+_root = logging.getLogger()
+_root.handlers.clear()
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(JSONFormatter())
+_root.addHandler(_handler)
+_root.setLevel(logging.INFO)
+
 log = logging.getLogger("serve")
 
 
@@ -123,6 +157,55 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="movielens recsys", lifespan=lifespan)
 
 
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail, "request_id": _request_id_var.get()},
+        headers={"x-request-id": _request_id_var.get()},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid request",
+            "details": exc.errors(),
+            "request_id": _request_id_var.get(),
+        },
+        headers={"x-request-id": _request_id_var.get()},
+    )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """assigns a uuid to every request, threads it via contextvar so logs include it."""
+    req_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    token = _request_id_var.set(req_id)
+    t0 = time.time()
+    try:
+        response = await call_next(request)
+        response.headers["x-request-id"] = req_id
+        log.info(
+            "request_done",
+            extra={
+                "path": request.url.path,
+                "method": request.method,
+                "status": response.status_code,
+                "duration_ms": round((time.time() - t0) * 1000, 2),
+            },
+        )
+        return response
+    finally:
+        _request_id_var.reset(token)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "models_loaded": "tt_model" in STATE}
@@ -135,8 +218,8 @@ def root():
 # ---------- request / response schemas ----------
 
 class RecommendRequest(BaseModel):
-    user_id: int = Field(..., description="original movielens userId")
-    k: int = Field(10, ge=1, le=100, description="number of recommendations")
+    user_id: int = Field(..., ge=1, description="original movielens userId, must be positive")
+    k: int = Field(10, ge=1, le=100, description="number of recommendations (1-100)")
 
 
 class Recommendation(BaseModel):
@@ -220,11 +303,10 @@ def _load_feature_lookups():
 def recommend(req: RecommendRequest):
     """retrieve top-200 via faiss, rerank with lightgbm, return top-k."""
     t_start = time.time()
-    _load_feature_lookups()
 
-    # map original userId -> dense user_idx
     user_to_idx = STATE["user_to_idx"]
     if req.user_id not in user_to_idx:
+        log.info("recommend_unknown_user", extra={"user_id": req.user_id})
         raise HTTPException(status_code=404, detail=f"unknown user_id {req.user_id}")
     user_idx = int(user_to_idx[req.user_id])
 
@@ -232,7 +314,6 @@ def recommend(req: RecommendRequest):
     tt_model = STATE["tt_model"]
     index = STATE["index"]
 
-    # encode user, faiss retrieve top-200
     t0 = time.time()
     with torch.no_grad():
         user_vec = tt_model.encode_user(
@@ -246,16 +327,15 @@ def recommend(req: RecommendRequest):
     tt_scores = D[0]
     t_retrieve = (time.time() - t0) * 1000
 
-    # mask seen
     seen = STATE["train_by_user"].get(user_idx, set())
     keep = ~np.isin(candidates, list(seen))
     candidates = candidates[keep]
     tt_scores = tt_scores[keep]
 
     if len(candidates) == 0:
+        log.info("recommend_no_candidates", extra={"user_id": req.user_id, "seen_count": len(seen)})
         raise HTTPException(status_code=503, detail="no candidates after masking")
 
-    # build feature matrix for lightgbm
     t0 = time.time()
     uf = STATE["user_feat_dict"][user_idx]
     ug_data = STATE["user_genre_dict"].get(user_idx, {})
@@ -295,13 +375,11 @@ def recommend(req: RecommendRequest):
         ]
     t_features = (time.time() - t0) * 1000
 
-    # rank
     t0 = time.time()
     ranker_scores = STATE["gbm"].predict(feats)
     order = np.argsort(-ranker_scores)[:req.k]
     t_rank = (time.time() - t0) * 1000
 
-    # build response
     idx_to_movie = STATE["idx_to_movie"]
     recs = [
         Recommendation(
@@ -312,6 +390,20 @@ def recommend(req: RecommendRequest):
         for rank, i in enumerate(order, start=1)
     ]
     total_ms = (time.time() - t_start) * 1000
+
+    log.info(
+        "recommend_ok",
+        extra={
+            "user_id": req.user_id,
+            "k": req.k,
+            "n_candidates": n_cand,
+            "total_ms": round(total_ms, 2),
+            "encode_ms": round(t_encode, 2),
+            "retrieve_ms": round(t_retrieve, 2),
+            "features_ms": round(t_features, 2),
+            "rank_ms": round(t_rank, 2),
+        },
+    )
 
     return RecommendResponse(
         user_id=req.user_id,
