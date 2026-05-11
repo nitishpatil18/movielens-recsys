@@ -1,0 +1,47 @@
+{
+  "n_features": 20,
+  "feature_cols": [
+    "u_num_ratings",
+    "u_mean_rating",
+    "u_std_rating",
+    "u_min_rating",
+    "u_max_rating",
+    "u_active_seconds",
+    "u_pct_high",
+    "u_pct_low",
+    "m_num_ratings",
+    "m_num_unique_users",
+    "m_mean_rating",
+    "m_std_rating",
+    "m_pct_high",
+    "m_pct_low",
+    "m_smoothed_mean",
+    "tt_score",
+    "ug_n_genres",
+    "ug_total_ratings",
+    "ug_mean_rating",
+    "ug_pct_high"
+  ],
+  "best_iteration": 500,
+  "best_auc": {
+    "train": 0.8768768717055648,
+    "eval": 0.8746491486712624
+  },
+  "end_to_end_metrics": {
+    "popularity": {
+      "recall@5": 0.020177230364597395,
+      "recall@10": 0.030107608822676296,
+      "recall@20": 0.04683331327569476
+    },
+    "tt_only": {
+      "recall@5": 0.02583821039417852,
+      "recall@10": 0.04345088248737947,
+      "recall@20": 0.06907497628312674
+    },
+    "tt_ranker": {
+      "recall@5": 0.03030103495001959,
+      "recall@10": 0.05042011539515202,
+      "recall@20": 0.08096555472070291
+    }
+  }
+}
