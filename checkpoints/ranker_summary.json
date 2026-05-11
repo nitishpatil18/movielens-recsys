@@ -1,5 +1,31 @@
 {
-  "n_features": 20,
+  "config": {
+    "data_dir": "/Users/nitishpatil/projects/recsys/data/parquet",
+    "ckpt_dir": "/Users/nitishpatil/projects/recsys/checkpoints",
+    "two_tower_ckpt": "two_tower.pt",
+    "n_pos_sample": 1000000,
+    "n_neg_per_pos": 5,
+    "neg_alpha": 0.75,
+    "like_threshold": 4.0,
+    "val_quantile": 0.9,
+    "train_eval_split": 0.8,
+    "num_rounds": 500,
+    "num_leaves": 63,
+    "learning_rate": 0.05,
+    "min_data_in_leaf": 200,
+    "lambda_l2": 1.0,
+    "feature_fraction": 0.9,
+    "bagging_fraction": 0.9,
+    "bagging_freq": 5,
+    "eval_n_users": 1000,
+    "eval_k_overfetch": 200,
+    "eval_k_list": [
+      5,
+      10,
+      20
+    ],
+    "seed": 42
+  },
   "feature_cols": [
     "u_num_ratings",
     "u_mean_rating",
@@ -16,32 +42,42 @@
     "m_pct_high",
     "m_pct_low",
     "m_smoothed_mean",
-    "tt_score",
     "ug_n_genres",
     "ug_total_ratings",
     "ug_mean_rating",
-    "ug_pct_high"
+    "ug_pct_high",
+    "tt_score"
   ],
-  "best_iteration": 500,
-  "best_auc": {
-    "train": 0.8768768717055648,
-    "eval": 0.8746491486712624
+  "lgb_metrics": {
+    "auc_train": 0.8769282344077198,
+    "auc_eval": 0.8740304563890133,
+    "best_iteration": 500,
+    "training_seconds": 464.9344689846039
   },
   "end_to_end_metrics": {
     "popularity": {
       "recall@5": 0.020177230364597395,
       "recall@10": 0.030107608822676296,
-      "recall@20": 0.04683331327569476
+      "recall@20": 0.04683331327569476,
+      "ndcg@5": 0.0869229218938109,
+      "ndcg@10": 0.07862541176795806,
+      "ndcg@20": 0.07350190795854258
     },
     "tt_only": {
       "recall@5": 0.02583821039417852,
       "recall@10": 0.04345088248737947,
-      "recall@20": 0.06907497628312674
+      "recall@20": 0.06907497628312674,
+      "ndcg@5": 0.11524740645836913,
+      "ndcg@10": 0.10483442425778554,
+      "ndcg@20": 0.10211866434513982
     },
     "tt_ranker": {
-      "recall@5": 0.03030103495001959,
-      "recall@10": 0.05042011539515202,
-      "recall@20": 0.08096555472070291
+      "recall@5": 0.03220135678741703,
+      "recall@10": 0.0514076139370182,
+      "recall@20": 0.08338467099271547,
+      "ndcg@5": 0.13178396921694335,
+      "ndcg@10": 0.12406443436796483,
+      "ndcg@20": 0.1205617446436509
     }
   }
 }
