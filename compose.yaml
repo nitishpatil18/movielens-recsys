@@ -1,5 +1,5 @@
 # usage:
-#   docker compose up -d         # start the service + prometheus
+#   docker compose up -d         # start api + prometheus + grafana
 #   docker compose logs -f       # follow logs
 #   docker compose down          # stop and remove
 
@@ -45,5 +45,24 @@ services:
       recsys-api:
         condition: service_healthy
 
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: recsys-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
 volumes:
   prometheus_data:
+  grafana_data:

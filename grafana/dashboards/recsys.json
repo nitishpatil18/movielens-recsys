@@ -1,0 +1,181 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "uid": "recsys-overview",
+  "title": "recsys api overview",
+  "tags": ["recsys", "mle"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": {"from": "now-15m", "to": "now"},
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "models loaded",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "recsys_models_loaded", "refId": "A"}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "p99 recommend latency (5m)",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(recsys_request_duration_seconds_bucket{endpoint=\"/recommend\"}[5m])))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.05}, {"color": "red", "value": 0.1}]}
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "textMode": "value"}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "recommend error rate (5m)",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(recsys_recommend_results_total{result!=\"ok\"}[5m])) / sum(rate(recsys_recommend_results_total[5m]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.05}, {"color": "red", "value": 0.15}]}
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "area", "textMode": "value"}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "median candidates after mask",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, rate(recsys_candidates_after_mask_bucket[5m]))",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 50}, {"color": "green", "value": 100}]}
+        }
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "requests/sec by endpoint",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {
+          "expr": "sum by (endpoint) (rate(recsys_requests_total[1m]))",
+          "legendFormat": "{{endpoint}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "reqps", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}}
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "latency percentiles - /recommend",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(recsys_request_duration_seconds_bucket{endpoint=\"/recommend\"}[1m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(recsys_request_duration_seconds_bucket{endpoint=\"/recommend\"}[1m])))",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(recsys_request_duration_seconds_bucket{endpoint=\"/recommend\"}[1m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "s", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 5}}
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "recommend outcomes/sec",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(recsys_recommend_results_total[1m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "reqps", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}}
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}}
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "candidates after mask - distribution over time",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.1, rate(recsys_candidates_after_mask_bucket[5m]))",
+          "legendFormat": "p10",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, rate(recsys_candidates_after_mask_bucket[5m]))",
+          "legendFormat": "p50",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.9, rate(recsys_candidates_after_mask_bucket[5m]))",
+          "legendFormat": "p90",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 5}}
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean"]}}
+    }
+  ]
+}

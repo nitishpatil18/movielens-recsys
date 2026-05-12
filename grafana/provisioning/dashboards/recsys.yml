@@ -1,0 +1,15 @@
+# tells grafana to auto-load dashboards from /var/lib/grafana/dashboards
+# docs: https://grafana.com/docs/grafana/latest/administration/provisioning/#dashboards
+
+apiVersion: 1
+
+providers:
+  - name: 'recsys-dashboards'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
