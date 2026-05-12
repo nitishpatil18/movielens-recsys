@@ -1,9 +1,7 @@
 # benchmark (m5 macbook air, 16gb, 100 sequential requests):
 #   total latency:    p50=6.3ms  p90=7.6ms  p99=11.1ms
 #   throughput:       139 req/s sequential (1 process, no batching)
-#   bottleneck:       lightgbm ranker (4.6ms median, ~70% of total)/
-
-
+#   bottleneck:       lightgbm ranker (4.6ms median, ~70% of total)
 
 """
 serve.py
@@ -19,13 +17,15 @@ then:
         -d '{"user_id": 12345, "k": 10}'
 """
 
+import json as _json
 import logging
 import os
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from fastapi import Request
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -36,23 +36,56 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
 from pydantic import BaseModel, Field
 
 faiss.omp_set_num_threads(1)
 torch.set_num_threads(1)
 
-# config
+
+# --- metrics ---
+REQUEST_COUNT = Counter(
+    "recsys_requests_total",
+    "total http requests",
+    labelnames=["endpoint", "status"],
+)
+
+RECOMMEND_RESULTS = Counter(
+    "recsys_recommend_results_total",
+    "recommendation outcomes",
+    labelnames=["result"],
+)
+
+REQUEST_LATENCY = Histogram(
+    "recsys_request_duration_seconds",
+    "request latency by endpoint",
+    labelnames=["endpoint"],
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+MODELS_LOADED = Gauge(
+    "recsys_models_loaded",
+    "1 if both models are loaded and feature lookups are ready",
+)
+
+CANDIDATES_AFTER_MASK = Histogram(
+    "recsys_candidates_after_mask",
+    "number of candidates surviving the seen-mask filter",
+    buckets=(0, 1, 10, 50, 100, 150, 200),
+)
+
+
+# --- config ---
 CKPT_DIR = Path(os.environ.get("RECSYS_CKPT_DIR", Path.home() / "projects" / "recsys" / "checkpoints"))
 DATA_DIR = Path(os.environ.get("RECSYS_DATA_DIR", Path.home() / "projects" / "recsys" / "data" / "parquet"))
 TWO_TOWER_CKPT = CKPT_DIR / "two_tower.pt"
 RANKER_CKPT = CKPT_DIR / "ranker.lgb"
 
-import json as _json
-import uuid
-from contextvars import ContextVar
 
-# request-scoped state — each request gets its own context, threaded via middleware
+# --- request-scoped state ---
 _request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
 
 
@@ -66,7 +99,6 @@ class JSONFormatter(logging.Formatter):
             "msg": record.getMessage(),
             "request_id": _request_id_var.get(),
         }
-        # extra fields passed via log.info("msg", extra={"key": ...})
         for key, value in record.__dict__.items():
             if key in ("name", "msg", "args", "levelname", "levelno", "pathname",
                       "filename", "module", "exc_info", "exc_text", "stack_info",
@@ -78,7 +110,6 @@ class JSONFormatter(logging.Formatter):
         return _json.dumps(payload, default=str)
 
 
-# install the json formatter on the root logger
 _root = logging.getLogger()
 _root.handlers.clear()
 _handler = logging.StreamHandler(sys.stdout)
@@ -89,7 +120,7 @@ _root.setLevel(logging.INFO)
 log = logging.getLogger("serve")
 
 
-# model class (must match training-time definition)
+# --- model class ---
 class TwoTower(nn.Module):
     def __init__(self, n_users, n_movies, dim):
         super().__init__()
@@ -99,29 +130,25 @@ class TwoTower(nn.Module):
     def encode_item(self, m): return self.item_emb(m)
 
 
-# global state — populated at startup
+# --- global state ---
 STATE = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """called once on startup, once on shutdown."""
     log.info("=== serve.py starting up ===")
     t0 = time.time()
 
-    # device
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     log.info(f"device: {device}")
 
-    # load two-tower
     log.info(f"loading two-tower from {TWO_TOWER_CKPT}")
     ckpt = torch.load(TWO_TOWER_CKPT, map_location=device, weights_only=False)
     tt_model = TwoTower(ckpt["n_users"], ckpt["n_movies"], ckpt["config"]["emb_dim"]).to(device)
     tt_model.load_state_dict(ckpt["model_state_dict"])
     tt_model.eval()
-    log.info(f"  two-tower: {ckpt['n_users']:,} × {ckpt['n_movies']:,} × {ckpt['config']['emb_dim']}")
+    log.info(f"  two-tower: {ckpt['n_users']:,} x {ckpt['n_movies']:,} x {ckpt['config']['emb_dim']}")
 
-    # precompute item vectors + faiss index
     with torch.no_grad():
         item_vecs = tt_model.encode_item(
             torch.arange(ckpt["n_movies"], dtype=torch.long, device=device)
@@ -130,13 +157,11 @@ async def lifespan(app: FastAPI):
     index.add(item_vecs)
     log.info(f"  faiss index: {index.ntotal:,} items")
 
-    # load ranker
     log.info(f"loading lightgbm ranker from {RANKER_CKPT}")
     gbm = lgb.Booster(model_file=str(RANKER_CKPT))
     feature_cols = gbm.feature_name()
     log.info(f"  ranker: {len(feature_cols)} features, {gbm.num_trees()} trees")
 
-    # stash everything
     STATE["device"] = device
     STATE["tt_model"] = tt_model
     STATE["index"] = index
@@ -147,7 +172,7 @@ async def lifespan(app: FastAPI):
     STATE["idx_to_movie"] = {i: m for m, i in ckpt["movie_to_idx"].items()}
     STATE["n_movies"] = ckpt["n_movies"]
 
-    log.info(f"=== startup complete in {time.time()-t0:.1f}s ===")
+    log.info(f"models loaded in {time.time()-t0:.1f}s, now loading feature lookups")
     _load_feature_lookups()
     log.info(f"=== startup complete in {time.time()-t0:.1f}s ===")
     yield
@@ -157,8 +182,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="movielens recsys", lifespan=lifespan)
 
 
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
+# expose /metrics for prometheus to scrape
+app.mount("/metrics", make_asgi_app())
 
 
 @app.exception_handler(HTTPException)
@@ -185,20 +210,26 @@ async def validation_exception_handler(request, exc: RequestValidationError):
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
-    """assigns a uuid to every request, threads it via contextvar so logs include it."""
     req_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     token = _request_id_var.set(req_id)
     t0 = time.time()
     try:
         response = await call_next(request)
+        duration = time.time() - t0
         response.headers["x-request-id"] = req_id
+
+        # metrics
+        endpoint = request.url.path
+        REQUEST_COUNT.labels(endpoint=endpoint, status=str(response.status_code)).inc()
+        REQUEST_LATENCY.labels(endpoint=endpoint).observe(duration)
+
         log.info(
             "request_done",
             extra={
-                "path": request.url.path,
+                "path": endpoint,
                 "method": request.method,
                 "status": response.status_code,
-                "duration_ms": round((time.time() - t0) * 1000, 2),
+                "duration_ms": round(duration * 1000, 2),
             },
         )
         return response
@@ -213,7 +244,8 @@ def health():
 
 @app.get("/")
 def root():
-    return {"service": "movielens-recsys", "endpoints": ["/health", "/recommend"]}
+    return {"service": "movielens-recsys", "endpoints": ["/health", "/recommend", "/recommend_batch", "/metrics"]}
+
 
 # ---------- request / response schemas ----------
 
@@ -235,10 +267,9 @@ class RecommendResponse(BaseModel):
     latency_ms: dict[str, float]
 
 
-# ---------- feature lookups loaded lazily on first /recommend call ----------
+# ---------- feature lookups loaded at startup ----------
 
 def _load_feature_lookups():
-    """build per-user feature dicts. lazy + cached because they take ~30s."""
     if "user_feat_dict" in STATE:
         return
     log.info("loading feature lookups (one-time, ~30s)")
@@ -284,7 +315,6 @@ def _load_feature_lookups():
     STATE["global_ug_mean"] = float(user_genre["mean_rating"].mean())
     STATE["global_ug_pct"] = float(user_genre["pct_high"].mean())
 
-    # also load train ratings for masking seen items
     log.info("loading training ratings for seen-set masking")
     ratings = pd.read_parquet(DATA_DIR / "ratings_clean.parquet")
     cutoff_ts = ratings["timestamp"].quantile(0.9)
@@ -297,15 +327,16 @@ def _load_feature_lookups():
     STATE["train_by_user"] = train_df.groupby("user_idx")["movie_idx"].apply(set).to_dict()
 
     log.info(f"feature lookups loaded in {time.time()-t0:.1f}s")
+    MODELS_LOADED.set(1)
 
 
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(req: RecommendRequest):
-    """retrieve top-200 via faiss, rerank with lightgbm, return top-k."""
     t_start = time.time()
 
     user_to_idx = STATE["user_to_idx"]
     if req.user_id not in user_to_idx:
+        RECOMMEND_RESULTS.labels(result="unknown_user").inc()
         log.info("recommend_unknown_user", extra={"user_id": req.user_id})
         raise HTTPException(status_code=404, detail=f"unknown user_id {req.user_id}")
     user_idx = int(user_to_idx[req.user_id])
@@ -333,6 +364,7 @@ def recommend(req: RecommendRequest):
     tt_scores = tt_scores[keep]
 
     if len(candidates) == 0:
+        RECOMMEND_RESULTS.labels(result="no_candidates").inc()
         log.info("recommend_no_candidates", extra={"user_id": req.user_id, "seen_count": len(seen)})
         raise HTTPException(status_code=503, detail="no candidates after masking")
 
@@ -391,6 +423,9 @@ def recommend(req: RecommendRequest):
     ]
     total_ms = (time.time() - t_start) * 1000
 
+    RECOMMEND_RESULTS.labels(result="ok").inc()
+    CANDIDATES_AFTER_MASK.observe(n_cand)
+
     log.info(
         "recommend_ok",
         extra={
@@ -418,6 +453,7 @@ def recommend(req: RecommendRequest):
         },
     )
 
+
 # ---------- batch endpoint ----------
 
 class RecommendBatchRequest(BaseModel):
@@ -440,8 +476,6 @@ class RecommendBatchResponse(BaseModel):
 
 @app.post("/recommend_batch", response_model=RecommendBatchResponse)
 def recommend_batch(req: RecommendBatchRequest):
-    """batched: encode all users in one mps op, faiss search in one call,
-    then rerank each user's candidates. amortizes fixed costs."""
     t_start = time.time()
 
     user_to_idx = STATE["user_to_idx"]
@@ -459,7 +493,6 @@ def recommend_batch(req: RecommendBatchRequest):
     g_mean = STATE["global_ug_mean"]
     g_pct = STATE["global_ug_pct"]
 
-    # split known vs unknown users
     known_users = []
     known_indices = []
     unknown_users = []
@@ -476,7 +509,6 @@ def recommend_batch(req: RecommendBatchRequest):
             results=[], latency_ms={"total": (time.time() - t_start) * 1000},
         )
 
-    # batched encoding
     t0 = time.time()
     with torch.no_grad():
         user_vecs = tt_model.encode_user(
@@ -484,12 +516,10 @@ def recommend_batch(req: RecommendBatchRequest):
         ).cpu().numpy().astype(np.float32)
     t_encode = (time.time() - t0) * 1000
 
-    # batched faiss search
     t0 = time.time()
     D, I = index.search(user_vecs, 200)
     t_retrieve = (time.time() - t0) * 1000
 
-    # per-user feature build + rank (the python loop part)
     t0 = time.time()
     results = []
     for u_pos, user_idx in enumerate(known_indices):
@@ -563,8 +593,3 @@ def recommend_batch(req: RecommendBatchRequest):
             "per_user_avg": round(total_ms / len(known_users), 3),
         },
     )
-
-#end-to-end fastapi service: two-tower retrieval (faiss) + lightgbm ranker, loaded at startup. measured concurrent load with httpx async client. 
-# sweet-spot operating point: concurrency 10, 725 req/s, p99 25ms. throughput peaks then collapses at concurrency 20+ due to python GIL contention 
-#on the cpu-bound rerank step. real deployment would scale horizontally with 4-8 uvicorn workers (~3000+ req/s per box) plus horizontal pod scaling 
-#for higher loads.

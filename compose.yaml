@@ -1,5 +1,5 @@
 # usage:
-#   docker compose up -d         # start the service in background
+#   docker compose up -d         # start the service + prometheus
 #   docker compose logs -f       # follow logs
 #   docker compose down          # stop and remove
 
@@ -13,7 +13,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # mount the local parquet data directory read-only
       - ./data/parquet:/data/parquet:ro
     environment:
       RECSYS_DATA_DIR: /data/parquet
@@ -27,3 +26,24 @@ services:
       timeout: 5s
       start_period: 60s
       retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: recsys-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    depends_on:
+      recsys-api:
+        condition: service_healthy
+
+volumes:
+  prometheus_data:

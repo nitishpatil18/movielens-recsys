@@ -1,0 +1,19 @@
+# prometheus scrape config
+# docs: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+
+global:
+  scrape_interval: 15s       # how often to scrape targets
+  evaluation_interval: 15s   # how often to evaluate alerting rules
+
+scrape_configs:
+  - job_name: 'recsys-api'
+    metrics_path: '/metrics'   # trailing slash to avoid 307 redirect
+    static_configs:
+      - targets: ['recsys-api:8000']
+        labels:
+          service: 'recsys-api'
+          env: 'local'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
