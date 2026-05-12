@@ -27,3 +27,4 @@ venv/
 *.pth
 checkpoints/*.pt
 checkpoints/*.lgb
+drift_artifacts/serving_features.jsonl

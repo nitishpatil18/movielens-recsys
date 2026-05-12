@@ -107,8 +107,7 @@ def build_reference():
 
 def sample_current_population(n_samples: int, drift_mode: str = "none") -> pd.DataFrame:
     """build a 'current' feature population by sampling users from the existing parquet.
-    in production, this would be a log of recent serving features. drift_mode lets us
-    inject synthetic drift for testing.
+    used as a control: drift_mode lets us inject synthetic drift for testing.
     """
     user_features = pd.read_parquet(DATA_DIR / "user_features.parquet")
     movie_features = pd.read_parquet(DATA_DIR / "movie_features.parquet")
@@ -121,7 +120,6 @@ def sample_current_population(n_samples: int, drift_mode: str = "none") -> pd.Da
     combined = pd.concat([u_sample.reset_index(drop=True), m_sample.reset_index(drop=True)], axis=1)
 
     if drift_mode == "shift_user_activity":
-        # synthetic drift: pretend the user base shifted to less active users
         combined["u_num_ratings"] = combined["u_num_ratings"] * 0.3
         combined["u_active_seconds"] = combined["u_active_seconds"] * 0.5
         log.warning("INJECTED DRIFT: u_num_ratings *= 0.3, u_active_seconds *= 0.5")
@@ -133,8 +131,42 @@ def sample_current_population(n_samples: int, drift_mode: str = "none") -> pd.Da
     return combined
 
 
-def detect_drift(n_samples: int, drift_mode: str = "none"):
-    """load reference, sample current, compute psi per feature, print report."""
+def load_serving_log(log_path: Path, last_n: int = None, drift_mode: str = "none") -> pd.DataFrame:
+    """load recent serving features from the jsonl log file written by serve.py.
+    this is the *real* production drift detection path: model is judged by what
+    it actually saw, not by what training-time data looks like.
+    """
+    if not log_path.exists():
+        log.error(f"no serving log at {log_path}. is the api running with serving log enabled?")
+        sys.exit(1)
+
+    rows = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    df = pd.DataFrame(rows)
+    if last_n is not None and len(df) > last_n:
+        df = df.tail(last_n).reset_index(drop=True)
+    log.info(f"loaded {len(df)} serving log rows from {log_path}")
+
+    if drift_mode == "shift_user_activity":
+        df["u_num_ratings"] = df["u_num_ratings"] * 0.3
+        df["u_active_seconds"] = df["u_active_seconds"] * 0.5
+        log.warning("INJECTED DRIFT (on serving log): u_num_ratings *= 0.3, u_active_seconds *= 0.5")
+    elif drift_mode == "shift_movie_quality":
+        log.warning("shift_movie_quality not applicable to serving log (no movie features captured)")
+
+    return df
+
+
+def detect_drift(n_samples: int, drift_mode: str = "none", source: str = "parquet", serving_log_path: Path = None):
+    """load reference, sample current population, compute psi per feature, print report.
+    
+    source='parquet':      sample from the parquet feature tables (test mode)
+    source='serving_log':  read the live jsonl log written by serve.py (production mode)
+    """
     if not REFERENCE_PATH.exists():
         log.error(f"no reference found at {REFERENCE_PATH}. run with --build-reference first.")
         sys.exit(1)
@@ -142,8 +174,12 @@ def detect_drift(n_samples: int, drift_mode: str = "none"):
     with open(REFERENCE_PATH) as f:
         reference = json.load(f)
 
-    log.info(f"sampling {n_samples} 'current' feature rows (drift_mode={drift_mode})")
-    current = sample_current_population(n_samples, drift_mode)
+    if source == "serving_log":
+        log_path = serving_log_path or (Path.home() / "projects" / "recsys" / "drift_artifacts" / "serving_features.jsonl")
+        current = load_serving_log(log_path, last_n=n_samples, drift_mode=drift_mode)
+    else:
+        log.info(f"sampling {n_samples} 'current' feature rows from parquet (drift_mode={drift_mode})")
+        current = sample_current_population(n_samples, drift_mode)
 
     results = []
     for feat, ref in reference["features"].items():
@@ -174,7 +210,6 @@ def detect_drift(n_samples: int, drift_mode: str = "none"):
             "mean_shift_z": mean_shift,
         })
 
-    # print report
     print()
     print(f"{'feature':<22s} {'psi':>8s} {'status':>10s} {'ref_mean':>10s} {'cur_mean':>10s} {'z_shift':>10s}")
     print("-" * 78)
@@ -187,6 +222,7 @@ def detect_drift(n_samples: int, drift_mode: str = "none"):
             n_warn += 1
     print("-" * 78)
     print(f"summary: {n_alert} ALERT, {n_warn} monitor, {len(results) - n_alert - n_warn} stable")
+    print(f"source: {source}, n_features_evaluated: {len(results)}")
 
     if n_alert > 0:
         log.error(f"DRIFT DETECTED on {n_alert} features. exit code 2.")
@@ -204,6 +240,10 @@ def main():
     p.add_argument("--n-samples", type=int, default=1000, help="size of current population sample")
     p.add_argument("--drift-mode", choices=["none", "shift_user_activity", "shift_movie_quality"], default="none",
                    help="inject synthetic drift for testing")
+    p.add_argument("--source", choices=["parquet", "serving_log"], default="parquet",
+                   help="parquet=resample training data (test), serving_log=real jsonl log from serve.py (production)")
+    p.add_argument("--serving-log-path", type=Path, default=None,
+                   help="override path to the serving features jsonl")
     args = p.parse_args()
 
     if not (args.build_reference or args.check):
@@ -213,7 +253,7 @@ def main():
     if args.build_reference:
         build_reference()
     if args.check:
-        detect_drift(args.n_samples, args.drift_mode)
+        detect_drift(args.n_samples, args.drift_mode, args.source, args.serving_log_path)
 
 
 if __name__ == "__main__":

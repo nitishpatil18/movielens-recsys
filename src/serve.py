@@ -84,6 +84,10 @@ DATA_DIR = Path(os.environ.get("RECSYS_DATA_DIR", Path.home() / "projects" / "re
 TWO_TOWER_CKPT = CKPT_DIR / "two_tower.pt"
 RANKER_CKPT = CKPT_DIR / "ranker.lgb"
 
+# serving feature log (1-in-N sampling). path is mounted as a volume in docker.
+SERVING_LOG_PATH = Path(os.environ.get("RECSYS_SERVING_LOG", "/tmp/recsys_serving.jsonl"))
+SERVING_LOG_SAMPLE_RATE = float(os.environ.get("RECSYS_SERVING_LOG_RATE", "0.01"))
+
 
 # --- request-scoped state ---
 _request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
@@ -422,6 +426,26 @@ def recommend(req: RecommendRequest):
         for rank, i in enumerate(order, start=1)
     ]
     total_ms = (time.time() - t_start) * 1000
+
+    # sample-log this request's served features for offline drift detection
+    if np.random.random() < SERVING_LOG_SAMPLE_RATE:
+        try:
+            sample_record = {
+                "ts": time.time(),
+                "user_id": req.user_id,
+                "u_num_ratings": float(uf["num_ratings"]),
+                "u_mean_rating": float(uf["mean_rating"]),
+                "u_std_rating": float(uf["std_rating"]),
+                "u_active_seconds": float(uf["active_seconds"]),
+                "u_pct_high": float(uf["pct_high"]),
+                "u_pct_low": float(uf["pct_low"]),
+                "n_candidates": int(n_cand),
+                "top_ranker_score": float(ranker_scores[order[0]]),
+            }
+            with open(SERVING_LOG_PATH, "a") as f:
+                f.write(_json.dumps(sample_record) + "\n")
+        except Exception as e:
+            log.warning("serving_log_write_failed", extra={"error": str(e)})
 
     RECOMMEND_RESULTS.labels(result="ok").inc()
     CANDIDATES_AFTER_MASK.observe(n_cand)

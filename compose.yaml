@@ -14,11 +14,14 @@ services:
       - "8000:8000"
     volumes:
       - ./data/parquet:/data/parquet:ro
+      - ./drift_artifacts:/serving_logs
     environment:
       RECSYS_DATA_DIR: /data/parquet
       RECSYS_CKPT_DIR: /app/checkpoints
       OMP_NUM_THREADS: "1"
       KMP_DUPLICATE_LIB_OK: "TRUE"
+      RECSYS_SERVING_LOG: /serving_logs/serving_features.jsonl
+      RECSYS_SERVING_LOG_RATE: "0.01"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
