@@ -1,7 +1,7 @@
 # usage:
-#   docker compose up -d         # start api + prometheus + grafana
-#   docker compose logs -f       # follow logs
-#   docker compose down          # stop and remove
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down
 
 services:
   recsys-api:
@@ -25,6 +25,7 @@ services:
       RECSYS_EXPERIMENT_ENABLED: "true"
       RECSYS_EXPERIMENT: "ranker_vs_no_ranker"
       RECSYS_VARIANT_A_PCT: "50"
+      RECSYS_DRIFT_SCORES_PATH: "/serving_logs/drift_scores.json"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
@@ -40,6 +41,7 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
@@ -50,6 +52,19 @@ services:
     depends_on:
       recsys-api:
         condition: service_healthy
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: recsys-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:11.3.0
@@ -71,4 +86,5 @@ services:
 
 volumes:
   prometheus_data:
+  alertmanager_data:
   grafana_data:

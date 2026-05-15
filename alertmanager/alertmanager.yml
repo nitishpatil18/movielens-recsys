@@ -1,0 +1,23 @@
+# alertmanager config
+# routes all alerts to a webhook that logs them. for local visibility.
+# in real production this routes to pagerduty/slack/email.
+# docs: https://prometheus.io/docs/alerting/latest/configuration/
+
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'severity']
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+  receiver: 'log-sink'
+
+receivers:
+  - name: 'log-sink'
+    # local-dev placeholder: log to webhook receiver. in prod this would be slack/pagerduty.
+    webhook_configs:
+      - url: 'http://localhost:9999/'
+        send_resolved: true
+
+inhibit_rules: []

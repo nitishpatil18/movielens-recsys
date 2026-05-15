@@ -86,7 +86,7 @@ RANKER_CKPT = CKPT_DIR / "ranker.lgb"
 
 # serving feature log (1-in-N sampling). path is mounted as a volume in docker.
 SERVING_LOG_PATH = Path(os.environ.get("RECSYS_SERVING_LOG", "/tmp/recsys_serving.jsonl"))
-SERVING_LOG_SAMPLE_RATE = float(os.environ.get("RECSYS_SERVING_LOG_RATE", "0.01"))
+SERVING_LOG_SAMPLE_RATE = float(os.environ.get("RECSYS_SERVING_LOG_RATE", "0.01")) 
 
 # a/b experiment config. variant assignment is deterministic per user_id.
 EXPERIMENT_NAME = os.environ.get("RECSYS_EXPERIMENT", "ranker_vs_no_ranker")
@@ -103,6 +103,34 @@ def assign_variant(user_id: int) -> str:
         return "A"  # control: full stack
     h = hash((EXPERIMENT_NAME, user_id)) % 100
     return "A" if h < VARIANT_A_PCT else "B"
+
+# --- drift score exposure ---
+DRIFT_SCORES_PATH = Path(os.environ.get("RECSYS_DRIFT_SCORES_PATH", "/serving_logs/drift_scores.json"))
+
+FEATURE_DRIFT_PSI = Gauge(
+    "recsys_feature_drift_psi",
+    "psi score per feature from latest drift_detector run",
+    labelnames=["feature"],
+)
+
+DRIFT_SCORES_TS = Gauge(
+    "recsys_drift_scores_timestamp",
+    "unix timestamp of the most recent drift detection run",
+)
+
+
+def _refresh_drift_scores():
+    """called periodically by the api. reads drift_scores.json and updates gauges."""
+    if not DRIFT_SCORES_PATH.exists():
+        return
+    try:
+        with open(DRIFT_SCORES_PATH) as f:
+            data = _json.load(f)
+        for feat, psi_val in data.get("scores", {}).items():
+            FEATURE_DRIFT_PSI.labels(feature=feat).set(float(psi_val))
+        DRIFT_SCORES_TS.set(float(data.get("ts", 0)))
+    except Exception as e:
+        log.warning("drift_scores_refresh_failed", extra={"error": str(e)})
 
 
 # --- request-scoped state ---
@@ -265,6 +293,15 @@ def health():
 @app.get("/")
 def root():
     return {"service": "movielens-recsys", "endpoints": ["/health", "/recommend", "/recommend_batch", "/metrics"]}
+
+@app.get("/admin/refresh_drift")
+def refresh_drift():
+    """reads drift_scores.json from disk and updates the drift psi gauges.
+    in production this would be triggered by a cron job that runs drift_detector,
+    then calls this endpoint. for local dev, just hit it manually after running detector.
+    """
+    _refresh_drift_scores()
+    return {"status": "refreshed", "drift_scores_path": str(DRIFT_SCORES_PATH)}
 
 
 # ---------- request / response schemas ----------

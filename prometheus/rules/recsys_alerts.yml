@@ -1,0 +1,47 @@
+# alert rules: prometheus evaluates these expressions every 15s (eval_interval).
+# when a rule's expr is true for the 'for' duration, an alert fires and gets
+# pushed to alertmanager.
+
+groups:
+  - name: recsys-api-alerts
+    interval: 30s
+    rules:
+      - alert: ModelsNotLoaded
+        expr: recsys_models_loaded == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: recsys-api
+        annotations:
+          summary: "models not loaded — service is degraded"
+          description: "recsys_models_loaded gauge has been 0 for 1m. either startup failed or a hot-reload is happening. /recommend will fail until this recovers."
+
+      - alert: HighRecommendLatency
+        expr: histogram_quantile(0.99, sum by (le) (rate(recsys_request_duration_seconds_bucket{endpoint="/recommend"}[5m]))) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          service: recsys-api
+        annotations:
+          summary: "p99 /recommend latency > 100ms"
+          description: "p99 latency on /recommend has been > 100ms for 2m. typical baseline is 25ms. likely cause: traffic spike, gc pause, or lightgbm rerank slowdown."
+
+      - alert: HighRecommendErrorRate
+        expr: sum(rate(recsys_recommend_results_total{result!="ok"}[5m])) / sum(rate(recsys_recommend_results_total[5m])) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: recsys-api
+        annotations:
+          summary: "/recommend non-ok rate > 10%"
+          description: "more than 10% of recommend requests are returning unknown_user or no_candidates. typical baseline is ~5%. could indicate downstream identity issues or training-data mismatch."
+
+      - alert: FeatureDriftDetected
+        expr: max(recsys_feature_drift_psi) > 0.25
+        for: 30s
+        labels:
+          severity: warning
+          service: recsys-api
+        annotations:
+          summary: "feature distribution drift detected"
+          description: "psi for at least one feature exceeded 0.25. inspect /metrics to find the offending feature and run drift_detector.py for the full report. likely cause: live traffic population shifted from training distribution."

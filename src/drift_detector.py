@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import sys
+import os
 import time
 from pathlib import Path
 
@@ -127,6 +128,10 @@ def sample_current_population(n_samples: int, drift_mode: str = "none") -> pd.Da
         combined["m_mean_rating"] = np.clip(combined["m_mean_rating"] - 0.8, 0.5, 5.0)
         combined["m_smoothed_mean"] = np.clip(combined["m_smoothed_mean"] - 0.5, 1.0, 5.0)
         log.warning("INJECTED DRIFT: m_mean_rating -= 0.8, m_smoothed_mean -= 0.5")
+    elif drift_mode == "brutal":
+        combined["u_num_ratings"] = combined["u_num_ratings"] * 0.05
+        combined["u_active_seconds"] = combined["u_active_seconds"] * 0.05
+        log.warning("INJECTED DRIFT: brutal (u_num_ratings *= 0.05, u_active_seconds *= 0.05)")
 
     return combined
 
@@ -157,6 +162,10 @@ def load_serving_log(log_path: Path, last_n: int = None, drift_mode: str = "none
         log.warning("INJECTED DRIFT (on serving log): u_num_ratings *= 0.3, u_active_seconds *= 0.5")
     elif drift_mode == "shift_movie_quality":
         log.warning("shift_movie_quality not applicable to serving log (no movie features captured)")
+    elif drift_mode == "brutal":
+        df["u_num_ratings"] = df["u_num_ratings"] * 0.05
+        df["u_active_seconds"] = df["u_active_seconds"] * 0.05
+        log.warning("INJECTED DRIFT (on serving log): brutal (u_num_ratings *= 0.05, u_active_seconds *= 0.05)")
 
     return df
 
@@ -210,6 +219,20 @@ def detect_drift(n_samples: int, drift_mode: str = "none", source: str = "parque
             "mean_shift_z": mean_shift,
         })
 
+    # write the latest psi scores to a json file that the api can expose as prometheus metrics
+    drift_scores_path = Path(os.environ.get("DRIFT_SCORES_PATH", Path.home() / "projects" / "recsys" / "drift_artifacts" / "drift_scores.json"))
+    try:
+        with open(drift_scores_path, "w") as f:
+            json.dump({
+                "ts": time.time(),
+                "scores": {r["feature"]: r["psi"] for r in results},
+                "n_alert": sum(1 for r in results if r["status"] == "ALERT"),
+                "n_warn": sum(1 for r in results if r["status"] == "monitor"),
+            }, f, indent=2)
+        log.info(f"drift scores written to {drift_scores_path}")
+    except Exception as e:
+        log.warning(f"could not write drift scores: {e}")
+
     print()
     print(f"{'feature':<22s} {'psi':>8s} {'status':>10s} {'ref_mean':>10s} {'cur_mean':>10s} {'z_shift':>10s}")
     print("-" * 78)
@@ -238,7 +261,7 @@ def main():
     p.add_argument("--build-reference", action="store_true", help="compute reference distributions from training data")
     p.add_argument("--check", action="store_true", help="run drift detection against reference")
     p.add_argument("--n-samples", type=int, default=1000, help="size of current population sample")
-    p.add_argument("--drift-mode", choices=["none", "shift_user_activity", "shift_movie_quality"], default="none",
+    p.add_argument("--drift-mode", choices=["none", "shift_user_activity", "shift_movie_quality", "brutal"], default="none",
                    help="inject synthetic drift for testing")
     p.add_argument("--source", choices=["parquet", "serving_log"], default="parquet",
                    help="parquet=resample training data (test), serving_log=real jsonl log from serve.py (production)")

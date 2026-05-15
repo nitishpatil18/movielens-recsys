@@ -1,13 +1,21 @@
-# prometheus scrape config
-# docs: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
-
+# prometheus scrape + alerting config
 global:
-  scrape_interval: 15s       # how often to scrape targets
-  evaluation_interval: 15s   # how often to evaluate alerting rules
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# load alert rules from these files
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# route firing alerts to alertmanager
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
 
 scrape_configs:
   - job_name: 'recsys-api'
-    metrics_path: '/metrics'   # trailing slash to avoid 307 redirect
+    metrics_path: '/metrics'
     static_configs:
       - targets: ['recsys-api:8000']
         labels:
@@ -17,3 +25,7 @@ scrape_configs:
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
+
+  - job_name: 'alertmanager'
+    static_configs:
+      - targets: ['alertmanager:9093']
