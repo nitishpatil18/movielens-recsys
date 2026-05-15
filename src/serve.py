@@ -88,6 +88,22 @@ RANKER_CKPT = CKPT_DIR / "ranker.lgb"
 SERVING_LOG_PATH = Path(os.environ.get("RECSYS_SERVING_LOG", "/tmp/recsys_serving.jsonl"))
 SERVING_LOG_SAMPLE_RATE = float(os.environ.get("RECSYS_SERVING_LOG_RATE", "0.01"))
 
+# a/b experiment config. variant assignment is deterministic per user_id.
+EXPERIMENT_NAME = os.environ.get("RECSYS_EXPERIMENT", "ranker_vs_no_ranker")
+EXPERIMENT_ENABLED = os.environ.get("RECSYS_EXPERIMENT_ENABLED", "false").lower() == "true"
+VARIANT_A_PCT = int(os.environ.get("RECSYS_VARIANT_A_PCT", "50"))
+
+
+def assign_variant(user_id: int) -> str:
+    """deterministic hash-based variant assignment. same user always gets same variant.
+    crucial property: if a user gets bucketed into A on monday they stay in A through
+    the entire experiment. random per-request routing would bias the analysis.
+    """
+    if not EXPERIMENT_ENABLED:
+        return "A"  # control: full stack
+    h = hash((EXPERIMENT_NAME, user_id)) % 100
+    return "A" if h < VARIANT_A_PCT else "B"
+
 
 # --- request-scoped state ---
 _request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
@@ -411,9 +427,17 @@ def recommend(req: RecommendRequest):
         ]
     t_features = (time.time() - t0) * 1000
 
+    variant = assign_variant(req.user_id)
+
     t0 = time.time()
-    ranker_scores = STATE["gbm"].predict(feats)
-    order = np.argsort(-ranker_scores)[:req.k]
+    if variant == "A":
+        # variant A (control): full stack with lightgbm rerank
+        ranker_scores = STATE["gbm"].predict(feats)
+        order = np.argsort(-ranker_scores)[:req.k]
+    else:
+        # variant B (treatment): two-tower retrieval only, no rerank
+        ranker_scores = tt_scores.astype(np.float64)
+        order = np.argsort(-tt_scores)[:req.k]
     t_rank = (time.time() - t0) * 1000
 
     idx_to_movie = STATE["idx_to_movie"]
@@ -433,6 +457,7 @@ def recommend(req: RecommendRequest):
             sample_record = {
                 "ts": time.time(),
                 "user_id": req.user_id,
+                "variant": variant,
                 "u_num_ratings": float(uf["num_ratings"]),
                 "u_mean_rating": float(uf["mean_rating"]),
                 "u_std_rating": float(uf["std_rating"]),
@@ -441,6 +466,7 @@ def recommend(req: RecommendRequest):
                 "u_pct_low": float(uf["pct_low"]),
                 "n_candidates": int(n_cand),
                 "top_ranker_score": float(ranker_scores[order[0]]),
+                "recommended_movie_ids": [int(idx_to_movie[int(candidates[i])]) for i in order],
             }
             with open(SERVING_LOG_PATH, "a") as f:
                 f.write(_json.dumps(sample_record) + "\n")

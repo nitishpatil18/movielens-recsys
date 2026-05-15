@@ -21,7 +21,10 @@ services:
       OMP_NUM_THREADS: "1"
       KMP_DUPLICATE_LIB_OK: "TRUE"
       RECSYS_SERVING_LOG: /serving_logs/serving_features.jsonl
-      RECSYS_SERVING_LOG_RATE: "0.01"
+      RECSYS_SERVING_LOG_RATE: "0.10"
+      RECSYS_EXPERIMENT_ENABLED: "true"
+      RECSYS_EXPERIMENT: "ranker_vs_no_ranker"
+      RECSYS_VARIANT_A_PCT: "50"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
