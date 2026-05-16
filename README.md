@@ -4,6 +4,8 @@ a two-stage recommender on movielens-25m, end to end: data + retrieval + ranking
 
 **recall@10 = 0.0504**, a **+67%** lift over popularity baseline and **+16%** over retrieval alone. served behind a fastapi container at **p99 ~ 25ms** (sweet-spot concurrency).
 
+see **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the system diagram + data flow.
+
 ---
 
 ## results
