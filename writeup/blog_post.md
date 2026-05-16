@@ -1,3 +1,5 @@
+<!-- private draft. not published. last updated 2026. -->
+
 # Building a Production Recommender for MovieLens-25M: From Data to Live A/B Test
 
 A two-stage recommendation system, built end-to-end on a laptop over 30 days. The point wasn't to chase state-of-the-art recall — it was to build the *operational* skeleton around a real model: serving, observability, drift detection, and experimentation. The parts most ML tutorials skip.
