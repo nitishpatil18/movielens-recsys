@@ -4,6 +4,8 @@ a two-stage recommender on movielens-25m, end to end: data + retrieval + ranking
 
 **recall@10 = 0.0504**, a **+67%** lift over popularity baseline and **+16%** over retrieval alone. served behind a fastapi container at **p99 ~ 25ms** (sweet-spot concurrency).
 
+**v2 in progress** on `feature/sasrec-sequential`: self-attentive sequential recommender (sasrec) added as a second flagship model. test full-vocab hit@10 = 0.0873. see [src/sasrec/README.md](./src/sasrec/README.md) and [CHANGELOG.md](./CHANGELOG.md) for details.
+
 see **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the system diagram + data flow.
 
 ---
@@ -82,13 +84,30 @@ a movie with one 5.0 rating shouldn't beat shawshank. smoothing pulls low-volume
 
 ---
 
+## v2 in progress: sasrec (sequential ranker)
+
+self-attentive sequential recommendation (kang & mcauley, icdm 2018) added on `feature/sasrec-sequential` as a second flagship model. attacks the v1 ceiling that static features can't break by modeling each user's interaction history as an ordered sequence with causal self-attention.
+
+leave-one-out test set, 160,491 users:
+
+| protocol     | hit@5  | hit@10 | hit@20 | ndcg@10 |
+|--------------|-------:|-------:|-------:|--------:|
+| sampled-pop  | 0.2186 | 0.3839 | 0.6003 | 0.1863  |
+| full-vocab   | 0.0495 | 0.0873 | 0.1479 | 0.0427  |
+
+**caveat**: these are sasrec's standalone numbers. v1 (`recall@10 = 0.0514`) was measured on a different split (time-based 90/10, cold-start filtered) and a different candidate pool (top-200 from two-tower, reranked by lightgbm). a controlled head-to-head with both models on the same leave-one-out test set is planned for week 9 day 1.
+
+full design doc and week-1 results in [src/sasrec/README.md](./src/sasrec/README.md).
+
+---
+
 ## what's not done (yet)
 
-- monitoring + drift detection
-- multi-worker uvicorn for horizontal throughput
+- controlled v1 vs sasrec head-to-head on identical eval split
+- sasrec integrated as a third candidate generator in `serve.py`
+- a/b test of sasrec vs no-sasrec via existing experiment framework
+- multi-worker uvicorn for horizontal throughput (gil contention limits single-worker to ~725 req/s)
 - ann index replacement at >1m items (IndexFlatIP -> IndexHNSWFlat)
-- sequential / session features in the ranker
-- a/b test framework
 
 ---
 
