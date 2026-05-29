@@ -30,3 +30,4 @@ checkpoints/*.lgb
 drift_artifacts/serving_features.jsonl
 drift_artifacts/drift_scores.json
 data/sequences/
+checkpoints/sasrec/
