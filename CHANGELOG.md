@@ -1,6 +1,17 @@
 # changelog
 
-a chronological log of the project's build. weeks 1-7 of a from-scratch movielens-25m two-stage recsys.
+a chronological log of the project's build. weeks 1-8 of a from-scratch movielens-25m two-stage recsys.
+
+## week 8: sequential ranker (sasrec)
+
+self-attentive sequential recommendation (kang & mcauley, icdm 2018) added as a second flagship model, attacking the v1 ceiling that static features can't break. on a feature branch (`feature/sasrec-sequential`), draft pr open against main.
+
+- **day 6** full training on all 160,491 users, 15 epochs, m5 mps, 4.2 min. final train loss 0.181. test full-vocab hit@10 = 0.0873, ndcg@10 = 0.0427. sampled-pop hit@10 = 0.3839. caveat: v1 numbers (recall@10=0.0514) used a different split and candidate pool. controlled head-to-head planned for week 9.
+- **day 5** eval with three protocols: sampled-pop (headline), sampled-uniform (paper protocol, known misleading), full-vocab (apples-to-apples ground). caught a leak: initial sampled-uniform hit@10=0.885 on the toy model collapsed to 0.883 with shuffled targets, proving user history wasn't contributing. diagnosis: embedding-norm vs log-popularity correlation = 0.469, so the positive wins on magnitude alone. fix: popularity-weighted negatives. reference: krichene & rendle, kdd 2020.
+- **day 4** training loop. shifted-target bce-bpr, one random negative per position, loss masked on pad. adamw (betas 0.9/0.98), grad clip 5.0. sanity run 1k users / 3 epochs: loss 1.31 → 0.89 in 3.6s.
+- **day 3** model: causal multi-head self-attention via pytorch fused sdpa, pre-layernorm transformer blocks, tied item embeddings as output head, learned positional embeddings. d_model=64, n_heads=2, n_blocks=2, dropout=0.2. 2.99M params (96% in the item embedding table). smoke test passes.
+- **day 2** sequence dataset builder. reads ratings_clean.parquet (25m rows), filters to rating ≥4.0, groups by user, sorts by timestamp, reuses two_tower.pt's movie_to_idx so sasrec and two-tower share item ids (pad reserved at index 0). leave-one-out split per paper convention. 160,491 users with ≥5 positives, median seq length 41, 6.5s build time.
+- **day 1** branch + folder scaffold (`src/sasrec/`) + design doc explaining motivation, integration with the existing two-tower + lightgbm stack, and expected ceiling break from sequence modeling.
 
 ## week 7: experimentation + alerting
 
