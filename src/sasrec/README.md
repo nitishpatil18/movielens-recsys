@@ -46,7 +46,7 @@ test set, 160,491 users, 15 epochs on m5 macbook air (mps), final train loss 0.1
 
 training wall clock: 254s (4.2 min) on m5 mps.
 
-**caveat**: these are sasrec's standalone numbers. v1 (recall@10=0.0514) was measured on a different split (time-based 90/10, cold-start filtered) and a different candidate pool (top-200 from two-tower retrieval, reranked by lightgbm). a controlled head-to-head with both models on the same leave-one-out split is planned for week 2 day 1.
+**caveat (resolved week 2 day 1)**: these are sasrec's standalone leave-one-out numbers. v1's `recall@10 = 0.0514` was measured on a different split and a different candidate pool, so this table is not directly comparable. the controlled head-to-head on v1's exact protocol is below.
 
 ## week 2 day 1: head-to-head vs v1
 

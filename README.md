@@ -4,7 +4,7 @@ a two-stage recommender on movielens-25m, end to end: data + retrieval + ranking
 
 **recall@10 = 0.0504**, a **+67%** lift over popularity baseline and **+16%** over retrieval alone. served behind a fastapi container at **p99 ~ 25ms** (sweet-spot concurrency).
 
-**v2 in progress** on `feature/sasrec-sequential`: self-attentive sequential recommender (sasrec) added as a second flagship model. test full-vocab hit@10 = 0.0873. see [src/sasrec/README.md](./src/sasrec/README.md) and [CHANGELOG.md](./CHANGELOG.md) for details.
+**v2 on `feature/sasrec-sequential`**: self-attentive sequential recommender (sasrec) added as a second flagship model. on v1's exact eval protocol, sasrec recall@10 = 0.0559 vs v1 0.0514 (**+8.8% relative lift**). v1 still wins ndcg@10. next step: combine the two via the existing lightgbm ranker. see [src/sasrec/README.md](./src/sasrec/README.md) and [CHANGELOG.md](./CHANGELOG.md).
 
 see **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the system diagram + data flow.
 
@@ -84,28 +84,34 @@ a movie with one 5.0 rating shouldn't beat shawshank. smoothing pulls low-volume
 
 ---
 
-## v2 in progress: sasrec (sequential ranker)
+## v2: sasrec (sequential ranker)
 
 self-attentive sequential recommendation (kang & mcauley, icdm 2018) added on `feature/sasrec-sequential` as a second flagship model. attacks the v1 ceiling that static features can't break by modeling each user's interaction history as an ordered sequence with causal self-attention.
 
-leave-one-out test set, 160,491 users:
+head-to-head on v1's exact eval protocol (time-based split, val_quantile=0.9, full-vocab scoring, train-seen masked, seed=42 sample of 1000 users):
 
-| protocol     | hit@5  | hit@10 | hit@20 | ndcg@10 |
-|--------------|-------:|-------:|-------:|--------:|
-| sampled-pop  | 0.2186 | 0.3839 | 0.6003 | 0.1863  |
-| full-vocab   | 0.0495 | 0.0873 | 0.1479 | 0.0427  |
+| model                      | recall@5 | recall@10 | recall@20 | ndcg@10 |
+|----------------------------|---------:|----------:|----------:|--------:|
+| popularity baseline (v1)   |   0.0202 |    0.0301 |    0.0468 |  0.0786 |
+| two-tower retrieval (v1)   |   0.0258 |    0.0435 |    0.0691 |  0.1048 |
+| two-tower + lightgbm (v1)  |   0.0322 |    0.0514 |    0.0834 |  0.1241 |
+| **sasrec (v2)**            | **0.0321** | **0.0559** | **0.0881** |  0.1192 |
 
-**caveat**: these are sasrec's standalone numbers. v1 (`recall@10 = 0.0514`) was measured on a different split (time-based 90/10, cold-start filtered) and a different candidate pool (top-200 from two-tower, reranked by lightgbm). a controlled head-to-head with both models on the same leave-one-out test set is planned for week 9 day 1.
+- recall@10: sasrec +8.8% relative lift over v1.
+- recall@20: sasrec +5.6%.
+- recall@5: tied.
+- ndcg@10: v1 wins by 4%.
 
-full design doc and week-1 results in [src/sasrec/README.md](./src/sasrec/README.md).
+sasrec catches retrieval candidates v1 misses, but doesn't rank them as well. obvious next move: combine — use sasrec as a third candidate generator feeding v1's lightgbm ranker. that's week 2 days 2-4.
+
+full design doc, week-1 leave-one-out results, and week-2 head-to-head in [src/sasrec/README.md](./src/sasrec/README.md).
 
 ---
 
 ## what's not done (yet)
 
-- controlled v1 vs sasrec head-to-head on identical eval split
-- sasrec integrated as a third candidate generator in `serve.py`
-- a/b test of sasrec vs no-sasrec via existing experiment framework
+- combine sasrec + v1: feed sasrec candidates into the lightgbm ranker as a third generator
+- a/b test of combined stack vs v1 via the existing experiment framework
 - multi-worker uvicorn for horizontal throughput (gil contention limits single-worker to ~725 req/s)
 - ann index replacement at >1m items (IndexFlatIP -> IndexHNSWFlat)
 
