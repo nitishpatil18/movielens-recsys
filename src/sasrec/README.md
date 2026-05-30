@@ -48,6 +48,70 @@ training wall clock: 254s (4.2 min) on m5 mps.
 
 **caveat (resolved week 2 day 1)**: these are sasrec's standalone leave-one-out numbers. v1's `recall@10 = 0.0514` was measured on a different split and a different candidate pool, so this table is not directly comparable. the controlled head-to-head on v1's exact protocol is below.
 
+## week 2 days 2-3: serving integration + ood ranker finding
+
+shipped sasrec into the running fastapi service behind two feature flags
+(`RECSYS_SASREC_ENABLED`, `RECSYS_RANKER_CKPT`). retrieval works, latency
+stays around 10ms warm. but the integration regressed recall, and the
+diagnosis is the most informative part of week 2.
+
+### measurement protocol
+
+all numbers below are recall@k against `val_liked` per user, using v1's
+exact eval pool: 1000 users sampled with `RandomState(seed=42)` from the
+6209 eligible eval users. ground truth is in `data/sequences_v1/val_liked.parquet`.
+the eval driver lives in `src/sasrec/eval_union_protocol.py` and hits the
+running server over http so it tests the deployed code path, not an
+offline approximation.
+
+### results
+
+| stack                                  | recall@5 | recall@10 | recall@20 | ndcg@10 |
+|----------------------------------------|---------:|----------:|----------:|--------:|
+| v1 (two-tower + lightgbm)              |   0.0308 |    0.0491 |    0.0738 |  0.1203 |
+| v1 + sasrec union, v1 ranker (20 ft)   |   0.0156 |    0.0290 |    0.0493 |  0.0701 |
+| v1 + sasrec union, v2 ranker (21 ft, bug) | 0.0146 | 0.0281    |    0.0515 |  0.0680 |
+| **v1 + sasrec union, v2 ranker (fixed)** | 0.0192 | **0.0329** | **0.0570** | **0.0803** |
+
+### finding: train/serve candidate-source skew
+
+v1's ranker was trained on (positive, popularity-weighted random negative)
+pairs. it never saw sasrec-retrieved items at training time. the v2 ranker
+added `sasrec_score` as a 21st feature (auc_eval 0.874 → 0.915, +4.7%,
+sasrec_score is the top feature by gain at ~8x tt_score's gain). but the
+training negative distribution is unchanged: random popular items.
+
+at serve time, sasrec adds 198 of its 200 retrieved candidates to the pool
+(overlap with two-tower top-200 is only 2 per user). those sasrec-only
+candidates all have high sasrec_score by construction — that's why sasrec
+retrieved them. the v2 ranker learned "high sasrec_score → positive" on a
+training distribution where high-sasrec items were a minority. at serve
+time they're the majority, so the ranker confidently promotes them into
+top-k positions, displacing items that would have actually matched
+val_liked.
+
+a feature-ordering bug was also found and fixed (`tt_score` and the
+ug_* columns were swapped in serve.py's feature row vs. v2's training
+column order). the fix gained +17% on recall@10 (0.0281 → 0.0329) but
+not enough to clear v1's 0.0491. the residual gap is the ood story.
+
+### why this is a real research finding
+
+the offline auc → online recall gap is a textbook out-of-distribution
+failure. high offline metrics ≠ shippable model when the deployed
+candidate distribution differs from the training negative distribution.
+this is exactly the class of bug that "measure before launch" exists
+to catch.
+
+### what comes next (week 2 day 4)
+
+rebuild the ranker training dataset so negatives include sasrec-retrieved
+items the user did NOT rate >= 4.0. this teaches the ranker to discriminate
+sasrec-retrieved positives from sasrec-retrieved negatives — the real
+serving task. expected lift: recall@10 above v1's 0.0491.
+
+## week 2 day 1: head-to-head vs v1
+
 ## week 2 day 1: head-to-head vs v1
 
 retrained sasrec on v1's exact split (time-based, val_quantile=0.9, cutoff 2017-12-31) with identical hyperparameters, then evaluated on v1's exact protocol (full-vocab, train-seen masked, multi-positive recall against `val_liked` per user). same eval pool, same seed (42), same sample size (1000) as v1's published numbers.
@@ -87,5 +151,7 @@ kang, w. & mcauley, j. "self-attentive sequential recommendation." ieee icdm 201
 - [x] day 6: full training run + test set numbers
 - [ ] day 7: week 1 changelog update + pr to main
 - [x] week 2 day 1: controlled v1 vs sasrec head-to-head (sasrec recall@10 = 0.0559 vs v1 0.0514, +8.8%)
-- [ ] week 2 day 2-4: integrate sasrec as third candidate gen in serve.py
-- [ ] week 2 day 5-7: a/b test sasrec vs no-sasrec via existing experiment framework
+- [x] week 2 day 2: sasrec integrated as third candidate gen in serve.py (behind feature flag)
+- [x] week 2 day 3: ranker v2 retrained with sasrec_score (auc 0.915 vs v1's 0.874, but online recall regressed - see writeup)
+- [ ] week 2 day 4: rebuild ranker training negatives from sasrec retrieval, re-measure
+- [ ] week 2 day 5+: a/b test combined stack vs v1 via existing experiment framework
