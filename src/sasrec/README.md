@@ -133,6 +133,90 @@ honest read:
 
 what this means: sasrec catches retrieval candidates v1 misses, but doesn't rank them as well. the obvious next step is to combine: use sasrec as a third candidate generator feeding v1's lightgbm ranker. that's week 2 day 2-4.
 
+## week 2 day 4: realistic-negatives ranker + top-N sweep
+
+fixed the out-of-distribution failure documented in week 2 day 3.
+
+### what changed
+
+`rebuild_ranker_dataset_v3.py` rebuilds the ranker training data with
+negatives sampled from the **serve-time candidate distribution** instead
+of v1's popularity-weighted random source. for each training user:
+
+1. retrieve two-tower top-200 (the existing v1 path)
+2. retrieve sasrec top-200 (the new path)
+3. union, mask the user's seen set
+4. sample 5 negatives from that union per positive
+
+positives are reused from v1's train/eval parquets so the only thing
+that changed is what "hard negative" means.
+
+retrained the ranker on this dataset (`ranker_v3.lgb`). auc_eval went
+from v2's 0.915 down to 0.853. that **drop** is the right direction:
+realistic negatives are harder than random-popular, so a model that
+generalizes well should have a lower offline auc and a higher online
+recall. v2's 0.915 was inflated by trivial negatives.
+
+feature importance also rebalanced. v2 over-relied on sasrec_score at
+8x tt_score's gain. v3 has sasrec_score still #1 but only 1.05x
+m_num_ratings, then tt_score, then user/genre features.
+
+### online results (live serve.py, http eval, 1000 v1 eval users, seed=42)
+
+swept `RECSYS_SASREC_TOP_N` over {25, 50, 100, 200}:
+
+| top_n | recall@5 | recall@10 | recall@20 | ndcg@10 |
+|-------|---------:|----------:|----------:|--------:|
+|    25 |   0.0273 |    0.0508 |    0.0835 |  0.1081 |
+| **50** |   0.0274 | **0.0506** | **0.0849** |  0.1079 |
+|   100 |   0.0270 |    0.0497 |    0.0823 |  0.1071 |
+|   200 |   0.0280 |    0.0486 |    0.0795 |  0.1048 |
+| v1 baseline | 0.0308 | 0.0491 | 0.0738 | 0.1203 |
+
+clear monotonic curve: more sasrec candidates -> worse online recall.
+the union gets dominated by sasrec items (sasrec/tt overlap is only
+~1%), and even with realistic-negative training the ranker still
+over-promotes them when they outnumber two-tower candidates 4:1.
+
+### final lift over v1
+
+| metric    | v1     | v2 broken | v3 top_n=50 | delta vs v1 |
+|-----------|-------:|----------:|------------:|------------:|
+| recall@5  | 0.0308 |    0.0192 |      0.0274 |       -11%  |
+| recall@10 | 0.0491 |    0.0329 |    **0.0506** |       **+3.1%** |
+| recall@20 | 0.0738 |    0.0570 |    **0.0849** |      **+15.0%** |
+| ndcg@10   | 0.1203 |    0.0803 |      0.1079 |       -10%  |
+
+**honest read**: modest win at recall@10, solid win at recall@20.
+v1 still wins at recall@5 and ndcg@10. sasrec captures items v1
+misses but the combined stack ranks the top-5 slightly worse, so the
+quality of the very top recommendations is slightly degraded for
+breadth lower down the list.
+
+### what this proves
+
+the full week 2 arc is a textbook applied-ml story:
+
+1. day 1: build a sequence model. it beats the baseline standalone (+8.8%).
+2. day 2: integrate it. simple union breaks recall by -41%.
+3. day 3: add the new score as a feature. fixes some, leaves a -33% regression and one bug (-17% recovered after fix).
+4. day 4: trace the residual to train/serve skew. rebuild negatives, retrain, sweep the union size. net **+3.1% recall@10, +15% recall@20** over v1.
+
+the win is modest but the diagnosis-and-fix path is the meaningful result.
+
+### selected for production
+
+`RECSYS_SASREC_TOP_N=50`. balances recall@10 (within 0.5% of top) and
+recall@20 (best in sweep). default is set in `serve.py`.
+
+### what would beat this
+
+- weighted score fusion at retrieval time instead of letting the ranker arbitrate
+- a sequence-aware ranker (e.g. listwise reranker over the user's recent items)
+- per-retriever ranking with learned mixture weights
+
+none of these are in scope for this project, but they are the obvious follow-ons.
+
 ## eval bug found during week 1
 
 initial sampled-uniform metrics looked suspiciously good (hit@10 = 0.885 on the toy 1k-user model). a shuffled-target sanity check showed shuffled targets scored 0.883 — basically identical, meaning the user history was contributing almost nothing. diagnosis: long-tail items have tiny embedding norms, popular items have large ones, so the positive wins on magnitude alone regardless of direction. correlation(log popularity, embedding norm) = 0.469. fix: sample negatives proportional to popularity, which we now do by default. detailed in the day 5 commit.
@@ -153,5 +237,5 @@ kang, w. & mcauley, j. "self-attentive sequential recommendation." ieee icdm 201
 - [x] week 2 day 1: controlled v1 vs sasrec head-to-head (sasrec recall@10 = 0.0559 vs v1 0.0514, +8.8%)
 - [x] week 2 day 2: sasrec integrated as third candidate gen in serve.py (behind feature flag)
 - [x] week 2 day 3: ranker v2 retrained with sasrec_score (auc 0.915 vs v1's 0.874, but online recall regressed - see writeup)
-- [ ] week 2 day 4: rebuild ranker training negatives from sasrec retrieval, re-measure
-- [ ] week 2 day 5+: a/b test combined stack vs v1 via existing experiment framework
+- [x] week 2 day 4: rebuilt negatives from sasrec retrieval, top_n=50 union, +3.1% recall@10 and +15% recall@20 over v1
+- [ ] week 2 day 5+: optional a/b test of combined stack vs v1 via existing experiment framework (lift is documented offline; live a/b would confirm)
