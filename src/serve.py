@@ -424,6 +424,31 @@ def _load_feature_lookups():
     train_df["movie_idx"] = train_df["movie_idx"].astype(np.int32)
     STATE["train_by_user"] = train_df.groupby("user_idx")["movie_idx"].apply(set).to_dict()
 
+    # build per-user ordered history for sasrec, but only when the flag is on.
+    # matches the training-time dataset exactly: rating >= 4.0, sorted by ts,
+    # last 50 items per user, shifted by +1 to item-token space (pad = 0).
+    if STATE.get("sasrec_model") is not None:
+        t_hist = time.time()
+        log.info("building sasrec history lookup (positives only, sorted by ts)")
+        pos = train_df[train_df["rating"] >= 4.0].sort_values(
+            ["user_idx", "timestamp"], kind="stable"
+        )
+        pos["item_token"] = pos["movie_idx"].astype(np.int64) + 1
+        # last 50 per user via groupby tail; convert to plain list[int] per row
+        last50 = pos.groupby("user_idx").tail(50)
+        STATE["sasrec_history_by_user"] = (
+            last50.groupby("user_idx")["item_token"]
+            .apply(lambda s: s.tolist())
+            .to_dict()
+        )
+        n_users_with_hist = len(STATE["sasrec_history_by_user"])
+        log.info(
+            f"  sasrec history: {n_users_with_hist:,} users with >=1 positive "
+            f"({time.time()-t_hist:.1f}s)"
+        )
+    else:
+        STATE["sasrec_history_by_user"] = {}
+
     log.info(f"feature lookups loaded in {time.time()-t0:.1f}s")
     MODELS_LOADED.set(1)
 
