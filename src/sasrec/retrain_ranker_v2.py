@@ -31,7 +31,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-ckpt", type=Path,
                    default=Path("checkpoints/ranker_v2.lgb"))
     p.add_argument("--out-summary", type=Path,
-                   default=Path("checkpoints/ranker_v2_summary.json"))
+                   default=None,
+                   help="defaults to checkpoints/ranker_{suffix}_summary.json")
+    p.add_argument("--suffix", default="v2",
+                   help="reads {ranker_dir}/train_{suffix}.parquet and writes ranker_{suffix}.lgb")
     # match v1 hyperparams exactly (from ranker_summary.json)
     p.add_argument("--num-rounds", type=int, default=500)
     p.add_argument("--num-leaves", type=int, default=63)
@@ -47,10 +50,20 @@ def parse_args() -> argparse.Namespace:
 
 def main(args: argparse.Namespace) -> dict:
     t0 = time.time()
+    # if user didn't pass explicit out paths, derive them from --suffix
+    default_ckpt = Path(f"checkpoints/ranker_{args.suffix}.lgb")
+    default_summary = Path(f"checkpoints/ranker_{args.suffix}_summary.json")
+    if args.out_ckpt == Path("checkpoints/ranker_v2.lgb"):
+        args.out_ckpt = default_ckpt
+    if args.out_summary is None:
+        args.out_summary = default_summary
 
-    print(f"[1/4] loading augmented dataset from {args.ranker_dir}")
-    train_df = pd.read_parquet(args.ranker_dir / "train_v2.parquet")
-    eval_df = pd.read_parquet(args.ranker_dir / "eval_v2.parquet")
+
+    train_path = args.ranker_dir / f"train_{args.suffix}.parquet"
+    eval_path = args.ranker_dir / f"eval_{args.suffix}.parquet"
+    print(f"[1/4] loading augmented dataset from {args.ranker_dir} (suffix={args.suffix})")
+    train_df = pd.read_parquet(train_path)
+    eval_df = pd.read_parquet(eval_path)
     print(f"      train: {train_df.shape}, eval: {eval_df.shape}")
     assert "sasrec_score" in train_df.columns, "sasrec_score missing in train_v2"
     assert "sasrec_score" in eval_df.columns, "sasrec_score missing in eval_v2"

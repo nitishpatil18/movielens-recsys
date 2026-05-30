@@ -39,3 +39,6 @@ data/parquet/ranker/train_v2.parquet
 data/parquet/ranker/eval_v2.parquet
 checkpoints/ranker_v2.lgb
 checkpoints/ranker_v2_summary.json
+data/parquet/ranker/train_v3.parquet
+data/parquet/ranker/eval_v3.parquet
+checkpoints/ranker_v3_summary.json
