@@ -31,3 +31,7 @@ drift_artifacts/serving_features.jsonl
 drift_artifacts/drift_scores.json
 data/sequences/
 checkpoints/sasrec/
+
+# sasrec week 2 additions
+checkpoints/sasrec_v1/
+data/sequences_v1/
