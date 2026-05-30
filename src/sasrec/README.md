@@ -48,6 +48,27 @@ training wall clock: 254s (4.2 min) on m5 mps.
 
 **caveat**: these are sasrec's standalone numbers. v1 (recall@10=0.0514) was measured on a different split (time-based 90/10, cold-start filtered) and a different candidate pool (top-200 from two-tower retrieval, reranked by lightgbm). a controlled head-to-head with both models on the same leave-one-out split is planned for week 2 day 1.
 
+## week 2 day 1: head-to-head vs v1
+
+retrained sasrec on v1's exact split (time-based, val_quantile=0.9, cutoff 2017-12-31) with identical hyperparameters, then evaluated on v1's exact protocol (full-vocab, train-seen masked, multi-positive recall against `val_liked` per user). same eval pool, same seed (42), same sample size (1000) as v1's published numbers.
+
+| model                      | recall@5 | recall@10 | recall@20 | ndcg@10 |
+|----------------------------|---------:|----------:|----------:|--------:|
+| popularity baseline (v1)   |   0.0202 |    0.0301 |    0.0468 |  0.0786 |
+| two-tower retrieval (v1)   |   0.0258 |    0.0435 |    0.0691 |  0.1048 |
+| two-tower + lightgbm (v1)  |   0.0322 |    0.0514 |    0.0834 |  0.1241 |
+| **sasrec (v2)**            | **0.0321** | **0.0559** | **0.0881** |  0.1192 |
+
+honest read:
+
+- **recall@10: +8.8% relative lift** over v1 (0.0559 vs 0.0514). sasrec wins on retrieval breadth.
+- **recall@20: +5.6%** (0.0881 vs 0.0834). gap is real, narrows at higher k.
+- **recall@5: tied** (0.0321 vs 0.0322). at very small k, both models agree on the top items.
+- **ndcg@10: v1 wins by 4%** (0.1241 vs 0.1192). v1's lightgbm reranker orders the top-k better than sasrec's raw dot product.
+- full-pool eval on all 6,209 eligible users gives recall@10 = 0.0568, essentially the same as the 1000-user sample. variance is low; the result is stable.
+
+what this means: sasrec catches retrieval candidates v1 misses, but doesn't rank them as well. the obvious next step is to combine: use sasrec as a third candidate generator feeding v1's lightgbm ranker. that's week 2 day 2-4.
+
 ## eval bug found during week 1
 
 initial sampled-uniform metrics looked suspiciously good (hit@10 = 0.885 on the toy 1k-user model). a shuffled-target sanity check showed shuffled targets scored 0.883 — basically identical, meaning the user history was contributing almost nothing. diagnosis: long-tail items have tiny embedding norms, popular items have large ones, so the positive wins on magnitude alone regardless of direction. correlation(log popularity, embedding norm) = 0.469. fix: sample negatives proportional to popularity, which we now do by default. detailed in the day 5 commit.
@@ -65,6 +86,6 @@ kang, w. & mcauley, j. "self-attentive sequential recommendation." ieee icdm 201
 - [x] day 5: eval metrics (three protocols, leak diagnosis)
 - [x] day 6: full training run + test set numbers
 - [ ] day 7: week 1 changelog update + pr to main
-- [ ] week 2 day 1: controlled v1 vs sasrec head-to-head
+- [x] week 2 day 1: controlled v1 vs sasrec head-to-head (sasrec recall@10 = 0.0559 vs v1 0.0514, +8.8%)
 - [ ] week 2 day 2-4: integrate sasrec as third candidate gen in serve.py
 - [ ] week 2 day 5-7: a/b test sasrec vs no-sasrec via existing experiment framework
