@@ -38,6 +38,8 @@ import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+
+from src.sasrec.model import SASRec
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
 from pydantic import BaseModel, Field
@@ -92,6 +94,14 @@ SERVING_LOG_SAMPLE_RATE = float(os.environ.get("RECSYS_SERVING_LOG_RATE", "0.01"
 EXPERIMENT_NAME = os.environ.get("RECSYS_EXPERIMENT", "ranker_vs_no_ranker")
 EXPERIMENT_ENABLED = os.environ.get("RECSYS_EXPERIMENT_ENABLED", "false").lower() == "true"
 VARIANT_A_PCT = int(os.environ.get("RECSYS_VARIANT_A_PCT", "50"))
+
+# sasrec (sequential candidate generator). off by default — flip the env var on
+# once you want sasrec candidates to be unioned into the existing pipeline.
+# the ranker still gets 20 features and knows nothing about sasrec; the lift
+# comes from a richer candidate pool, not from a new feature.
+SASREC_ENABLED = os.environ.get("RECSYS_SASREC_ENABLED", "false").lower() == "true"
+SASREC_CKPT = Path(os.environ.get("RECSYS_SASREC_CKPT", str(CKPT_DIR / "sasrec_v1" / "sasrec.pt")))
+SASREC_TOP_N = int(os.environ.get("RECSYS_SASREC_TOP_N", "200"))
 
 
 def assign_variant(user_id: int) -> str:
@@ -210,11 +220,42 @@ async def lifespan(app: FastAPI):
     feature_cols = gbm.feature_name()
     log.info(f"  ranker: {len(feature_cols)} features, {gbm.num_trees()} trees")
 
+    # sasrec is optional. if disabled (default) we skip the load entirely so
+    # startup time and memory are unchanged. when enabled, load the model and
+    # keep it on the same device as two-tower so we can score on the same gpu.
+    sasrec_model = None
+    if SASREC_ENABLED:
+        log.info(f"loading sasrec from {SASREC_CKPT}")
+        if not SASREC_CKPT.exists():
+            log.error(f"sasrec checkpoint missing at {SASREC_CKPT}; serving without sasrec")
+        else:
+            s_ckpt = torch.load(SASREC_CKPT, map_location=device, weights_only=False)
+            s_cfg = s_ckpt["config"]
+            sasrec_model = SASRec(
+                vocab_size=s_cfg["vocab_size"],
+                d_model=s_cfg["d_model"],
+                n_heads=s_cfg["n_heads"],
+                n_blocks=s_cfg["n_blocks"],
+                max_seq_len=s_cfg["max_seq_len"],
+                dropout=s_cfg["dropout"],
+            ).to(device)
+            sasrec_model.load_state_dict(s_ckpt["model_state"])
+            sasrec_model.eval()
+            log.info(
+                f"  sasrec: vocab={s_cfg['vocab_size']:,} d={s_cfg['d_model']} "
+                f"blocks={s_cfg['n_blocks']} heads={s_cfg['n_heads']} "
+                f"seq_len={s_cfg['max_seq_len']}"
+            )
+    else:
+        log.info("sasrec disabled (RECSYS_SASREC_ENABLED=false)")
+
     STATE["device"] = device
     STATE["tt_model"] = tt_model
     STATE["index"] = index
     STATE["gbm"] = gbm
     STATE["feature_cols"] = feature_cols
+    STATE["sasrec_model"] = sasrec_model  # None if disabled
+    STATE["sasrec_top_n"] = SASREC_TOP_N
     STATE["user_to_idx"] = ckpt["user_to_idx"]
     STATE["movie_to_idx"] = ckpt["movie_to_idx"]
     STATE["idx_to_movie"] = {i: m for m, i in ckpt["movie_to_idx"].items()}
