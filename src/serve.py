@@ -84,7 +84,7 @@ CANDIDATES_AFTER_MASK = Histogram(
 CKPT_DIR = Path(os.environ.get("RECSYS_CKPT_DIR", Path.home() / "projects" / "recsys" / "checkpoints"))
 DATA_DIR = Path(os.environ.get("RECSYS_DATA_DIR", Path.home() / "projects" / "recsys" / "data" / "parquet"))
 TWO_TOWER_CKPT = CKPT_DIR / "two_tower.pt"
-RANKER_CKPT = CKPT_DIR / "ranker.lgb"
+RANKER_CKPT = Path(os.environ.get("RECSYS_RANKER_CKPT", str(CKPT_DIR / "ranker.lgb")))
 
 # serving feature log (1-in-N sampling). path is mounted as a volume in docker.
 SERVING_LOG_PATH = Path(os.environ.get("RECSYS_SERVING_LOG", "/tmp/recsys_serving.jsonl"))
@@ -476,44 +476,56 @@ def _load_feature_lookups():
 
 
 
-def _sasrec_candidates(user_idx: int, seen: set, top_n: int) -> tuple[np.ndarray, np.ndarray]:
+def _sasrec_last_hidden(user_idx: int) -> torch.Tensor | None:
     """
-    return (movie_idxs, scores) sasrec would have surfaced for this user.
-    movie_idxs are in two-tower / faiss space (NOT item-token space).
-    scores are the raw dot products of last hidden state and item embeddings,
-    so they live on sasrec's score scale. used today only for logging; not
-    consumed by the ranker (week 2 day 3 retrains the ranker with sasrec_score
-    as a real feature).
-
-    if the user has no positive history, returns empty arrays.
+    compute and return the (D,) last hidden state for a user, on whatever
+    device the sasrec model lives on. None if the user has no positive
+    history. used by both _sasrec_candidates (for retrieval) and the
+    request path (to compute sasrec_score per candidate for the ranker).
     """
     history = STATE.get("sasrec_history_by_user", {}).get(user_idx)
     if not history:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
-
+        return None
     model = STATE["sasrec_model"]
     device = STATE["device"]
     max_seq_len = model.max_seq_len
-
-    # left-pad to max_seq_len, take last max_seq_len if longer
     history = history[-max_seq_len:]
     seq = np.zeros(max_seq_len, dtype=np.int64)
     seq[max_seq_len - len(history):] = history
     seq_t = torch.from_numpy(seq).unsqueeze(0).to(device)
-
     with torch.no_grad():
-        hidden = model(seq_t)               # (1, T, D)
-        last_hidden = hidden[:, -1, :]      # (1, D)
-        scores = (last_hidden @ model.item_emb.weight.T).squeeze(0)  # (V,)
+        hidden = model(seq_t)
+    return hidden[0, -1, :]  # (D,)
 
-    # mask pad token and items the user has already seen.
-    # convert seen (movie_idx) to item-token space (+1) for the mask.
+
+def _sasrec_candidates(
+    user_idx: int, seen: set, top_n: int,
+    last_hidden: torch.Tensor | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    return (movie_idxs, scores) sasrec would have surfaced for this user.
+    movie_idxs are in two-tower / faiss space (NOT item-token space).
+    scores are the raw dot products of last hidden state and item embeddings.
+
+    if last_hidden is provided (computed once per request), we reuse it
+    instead of redoing the forward pass. saves ~2ms per request.
+
+    if the user has no positive history, returns empty arrays.
+    """
+    if last_hidden is None:
+        last_hidden = _sasrec_last_hidden(user_idx)
+        if last_hidden is None:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+
+    model = STATE["sasrec_model"]
+    with torch.no_grad():
+        scores = (last_hidden.unsqueeze(0) @ model.item_emb.weight.T).squeeze(0)  # (V,)
+
     scores_np = scores.cpu().numpy()
     scores_np[0] = -np.inf
     if seen:
         scores_np[np.fromiter(seen, dtype=np.int64) + 1] = -np.inf
 
-    # top-N indices in item-token space, then back to movie_idx (-1).
     top_tokens = np.argpartition(-scores_np, top_n)[:top_n]
     top_tokens = top_tokens[np.argsort(-scores_np[top_tokens])]
     top_movies = (top_tokens - 1).astype(np.int64)
@@ -562,25 +574,29 @@ def recommend(req: RecommendRequest):
     sasrec_n = 0
     sasrec_overlap = 0
     sasrec_added = 0
+    sasrec_last_hidden = None  # reused for scoring final candidates as 21st feature
     t0 = time.time()
     if SASREC_ENABLED and STATE.get("sasrec_model") is not None:
-        s_cands, s_scores = _sasrec_candidates(
-            user_idx, seen, STATE["sasrec_top_n"]
-        )
-        sasrec_n = int(len(s_cands))
-        if sasrec_n > 0:
-            tt_set = set(int(c) for c in candidates)
-            new_mask = ~np.isin(s_cands, list(tt_set))
-            sasrec_overlap = int(sasrec_n - new_mask.sum())
-            new_cands = s_cands[new_mask]
-            sasrec_added = int(len(new_cands))
-            if sasrec_added > 0:
-                median_tt = (
-                    float(np.median(tt_scores)) if len(tt_scores) > 0 else 0.0
-                )
-                filler = np.full(sasrec_added, median_tt, dtype=np.float32)
-                candidates = np.concatenate([candidates, new_cands])
-                tt_scores = np.concatenate([tt_scores, filler])
+        sasrec_last_hidden = _sasrec_last_hidden(user_idx)
+        if sasrec_last_hidden is not None:
+            s_cands, s_scores = _sasrec_candidates(
+                user_idx, seen, STATE["sasrec_top_n"],
+                last_hidden=sasrec_last_hidden,
+            )
+            sasrec_n = int(len(s_cands))
+            if sasrec_n > 0:
+                tt_set = set(int(c) for c in candidates)
+                new_mask = ~np.isin(s_cands, list(tt_set))
+                sasrec_overlap = int(sasrec_n - new_mask.sum())
+                new_cands = s_cands[new_mask]
+                sasrec_added = int(len(new_cands))
+                if sasrec_added > 0:
+                    median_tt = (
+                        float(np.median(tt_scores)) if len(tt_scores) > 0 else 0.0
+                    )
+                    filler = np.full(sasrec_added, median_tt, dtype=np.float32)
+                    candidates = np.concatenate([candidates, new_cands])
+                    tt_scores = np.concatenate([tt_scores, filler])
     t_sasrec_ms = (time.time() - t0) * 1000
 
     if len(candidates) == 0:
@@ -598,7 +614,25 @@ def recommend(req: RecommendRequest):
     feature_cols = STATE["feature_cols"]
 
     n_cand = len(candidates)
-    feats = np.empty((n_cand, len(feature_cols)), dtype=np.float32)
+    # if the loaded ranker expects 21 features (i.e. ranker_v2), precompute
+    # sasrec_score per candidate by dotting the cached last_hidden against each
+    # candidate's item embedding. matrix op, ~0.1ms for 400 candidates.
+    n_features = len(feature_cols)
+    if n_features == 21 and sasrec_last_hidden is not None:
+        cand_tokens = torch.from_numpy(
+            candidates.astype(np.int64) + 1
+        ).to(STATE["device"])
+        with torch.no_grad():
+            cand_item_emb = STATE["sasrec_model"].item_emb.weight[cand_tokens]
+            cand_sasrec_scores = (
+                cand_item_emb @ sasrec_last_hidden
+            ).cpu().numpy().astype(np.float32)
+    else:
+        # v1 ranker, or sasrec disabled. fill with zeros; v1 ranker will ignore
+        # the 21st column because we slice rows below to match feature_cols length.
+        cand_sasrec_scores = np.zeros(n_cand, dtype=np.float32)
+
+    feats = np.empty((n_cand, 21), dtype=np.float32)
     for j, m_idx in enumerate(candidates):
         m_idx = int(m_idx)
         mf = movie_feat_dict[m_idx]
@@ -622,9 +656,13 @@ def recommend(req: RecommendRequest):
             uf["max_rating"], uf["active_seconds"], uf["pct_high"], uf["pct_low"],
             mf["num_ratings"], mf["num_unique_users"], mf["mean_rating"], mf["std_rating"],
             mf["pct_high"], mf["pct_low"], mf["smoothed_mean"],
-            ug_n, ug_total, ug_mean, ug_pct,
             tt_scores[j],
+            ug_n, ug_total, ug_mean, ug_pct,
+            cand_sasrec_scores[j],
         ]
+    # if the loaded ranker is v1 (20 features), drop the extra sasrec_score column.
+    if n_features == 20:
+        feats = feats[:, :20]
     t_features = (time.time() - t0) * 1000
 
     variant = assign_variant(req.user_id)

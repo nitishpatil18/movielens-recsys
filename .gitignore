@@ -35,3 +35,7 @@ checkpoints/sasrec/
 # sasrec week 2 additions
 checkpoints/sasrec_v1/
 data/sequences_v1/
+data/parquet/ranker/train_v2.parquet
+data/parquet/ranker/eval_v2.parquet
+checkpoints/ranker_v2.lgb
+checkpoints/ranker_v2_summary.json
