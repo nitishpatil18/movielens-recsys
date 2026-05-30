@@ -263,6 +263,27 @@ async def lifespan(app: FastAPI):
 
     log.info(f"models loaded in {time.time()-t0:.1f}s, now loading feature lookups")
     _load_feature_lookups()
+
+    # warm-up pass on each model to pay the mps kernel-compilation cost up
+    # front. without this the first user request takes 100+ ms instead of the
+    # steady-state ~10ms. uses a dummy tensor; no real prediction is consumed.
+    log.info("warming up models (mps kernel compilation)")
+    t_warm = time.time()
+    with torch.no_grad():
+        # two-tower: encode a single dummy user.
+        _ = tt_model.encode_user(
+            torch.zeros(1, dtype=torch.long, device=device)
+        )
+        # sasrec: forward + scoring on a single dummy sequence.
+        if sasrec_model is not None:
+            dummy = torch.zeros(
+                (1, sasrec_model.max_seq_len), dtype=torch.long, device=device
+            )
+            dummy[0, -1] = 1  # one non-pad token at the last position
+            hidden = sasrec_model(dummy)
+            _ = (hidden[:, -1, :] @ sasrec_model.item_emb.weight.T).cpu()
+    log.info(f"  warm-up: {(time.time()-t_warm)*1000:.0f}ms")
+
     log.info(f"=== startup complete in {time.time()-t0:.1f}s ===")
     yield
     log.info("=== serve.py shutting down ===")
@@ -453,6 +474,52 @@ def _load_feature_lookups():
     MODELS_LOADED.set(1)
 
 
+
+
+def _sasrec_candidates(user_idx: int, seen: set, top_n: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    return (movie_idxs, scores) sasrec would have surfaced for this user.
+    movie_idxs are in two-tower / faiss space (NOT item-token space).
+    scores are the raw dot products of last hidden state and item embeddings,
+    so they live on sasrec's score scale. used today only for logging; not
+    consumed by the ranker (week 2 day 3 retrains the ranker with sasrec_score
+    as a real feature).
+
+    if the user has no positive history, returns empty arrays.
+    """
+    history = STATE.get("sasrec_history_by_user", {}).get(user_idx)
+    if not history:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+
+    model = STATE["sasrec_model"]
+    device = STATE["device"]
+    max_seq_len = model.max_seq_len
+
+    # left-pad to max_seq_len, take last max_seq_len if longer
+    history = history[-max_seq_len:]
+    seq = np.zeros(max_seq_len, dtype=np.int64)
+    seq[max_seq_len - len(history):] = history
+    seq_t = torch.from_numpy(seq).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        hidden = model(seq_t)               # (1, T, D)
+        last_hidden = hidden[:, -1, :]      # (1, D)
+        scores = (last_hidden @ model.item_emb.weight.T).squeeze(0)  # (V,)
+
+    # mask pad token and items the user has already seen.
+    # convert seen (movie_idx) to item-token space (+1) for the mask.
+    scores_np = scores.cpu().numpy()
+    scores_np[0] = -np.inf
+    if seen:
+        scores_np[np.fromiter(seen, dtype=np.int64) + 1] = -np.inf
+
+    # top-N indices in item-token space, then back to movie_idx (-1).
+    top_tokens = np.argpartition(-scores_np, top_n)[:top_n]
+    top_tokens = top_tokens[np.argsort(-scores_np[top_tokens])]
+    top_movies = (top_tokens - 1).astype(np.int64)
+    top_scores = scores_np[top_tokens].astype(np.float32)
+    return top_movies, top_scores
+
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(req: RecommendRequest):
     t_start = time.time()
@@ -485,6 +552,36 @@ def recommend(req: RecommendRequest):
     keep = ~np.isin(candidates, list(seen))
     candidates = candidates[keep]
     tt_scores = tt_scores[keep]
+
+    # sasrec candidate union, gated on the flag.
+    # this stage adds candidates only; the ranker still gets 20 features and
+    # the same tt_score per candidate. for sasrec-only items we fill tt_score
+    # with the median of the existing pool (least-bad neutral value). this is
+    # a known compromise; week 2 day 3 retrains the ranker with sasrec_score
+    # as a real 21st feature.
+    sasrec_n = 0
+    sasrec_overlap = 0
+    sasrec_added = 0
+    t0 = time.time()
+    if SASREC_ENABLED and STATE.get("sasrec_model") is not None:
+        s_cands, s_scores = _sasrec_candidates(
+            user_idx, seen, STATE["sasrec_top_n"]
+        )
+        sasrec_n = int(len(s_cands))
+        if sasrec_n > 0:
+            tt_set = set(int(c) for c in candidates)
+            new_mask = ~np.isin(s_cands, list(tt_set))
+            sasrec_overlap = int(sasrec_n - new_mask.sum())
+            new_cands = s_cands[new_mask]
+            sasrec_added = int(len(new_cands))
+            if sasrec_added > 0:
+                median_tt = (
+                    float(np.median(tt_scores)) if len(tt_scores) > 0 else 0.0
+                )
+                filler = np.full(sasrec_added, median_tt, dtype=np.float32)
+                candidates = np.concatenate([candidates, new_cands])
+                tt_scores = np.concatenate([tt_scores, filler])
+    t_sasrec_ms = (time.time() - t0) * 1000
 
     if len(candidates) == 0:
         RECOMMEND_RESULTS.labels(result="no_candidates").inc()
@@ -585,6 +682,11 @@ def recommend(req: RecommendRequest):
             "user_id": req.user_id,
             "k": req.k,
             "n_candidates": n_cand,
+            "sasrec_enabled": bool(SASREC_ENABLED),
+            "sasrec_n": sasrec_n,
+            "sasrec_overlap_with_tt": sasrec_overlap,
+            "sasrec_added": sasrec_added,
+            "sasrec_ms": round(t_sasrec_ms, 2),
             "total_ms": round(total_ms, 2),
             "encode_ms": round(t_encode, 2),
             "retrieve_ms": round(t_retrieve, 2),
