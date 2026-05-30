@@ -4,7 +4,7 @@ a two-stage recommender on movielens-25m, end to end: data + retrieval + ranking
 
 **recall@10 = 0.0504**, a **+67%** lift over popularity baseline and **+16%** over retrieval alone. served behind a fastapi container at **p99 ~ 25ms** (sweet-spot concurrency).
 
-**v2 on `feature/sasrec-sequential`**: self-attentive sequential recommender (sasrec) added as a second flagship model. on v1's exact eval protocol, sasrec recall@10 = 0.0559 vs v1 0.0514 (**+8.8% relative lift**). v1 still wins ndcg@10. next step: combine the two via the existing lightgbm ranker. see [src/sasrec/README.md](./src/sasrec/README.md) and [CHANGELOG.md](./CHANGELOG.md).
+**v2 on `feature/sasrec-sequential`**: self-attentive sequential recommender (sasrec) added as a second flagship model. standalone, sasrec recall@10 = 0.0559 vs v1 0.0514 on v1's exact eval protocol (**+8.8%**). first integration attempt regressed online recall: ranker v2 (21 features, auc_eval 0.915, sasrec_score top feature) was trained on popularity-weighted random negatives but serves over a sasrec-dominated candidate pool. classic out-of-distribution failure, diagnosed in [src/sasrec/README.md](./src/sasrec/README.md). next: rebuild ranker negatives from sasrec retrieval. full project log in [CHANGELOG.md](./CHANGELOG.md).
 
 see **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the system diagram + data flow.
 
@@ -110,8 +110,8 @@ full design doc, week-1 leave-one-out results, and week-2 head-to-head in [src/s
 
 ## what's not done (yet)
 
-- combine sasrec + v1: feed sasrec candidates into the lightgbm ranker as a third generator
-- a/b test of combined stack vs v1 via the existing experiment framework
+- rebuild ranker training negatives from sasrec retrieval to fix the out-of-distribution failure documented in v2 day 3
+- a/b test of fixed combined stack vs v1 via the existing experiment framework
 - multi-worker uvicorn for horizontal throughput (gil contention limits single-worker to ~725 req/s)
 - ann index replacement at >1m items (IndexFlatIP -> IndexHNSWFlat)
 
