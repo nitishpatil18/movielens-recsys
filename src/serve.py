@@ -38,6 +38,8 @@ import torch
 import torch.nn as nn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+
+from src.sasrec.model import SASRec
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
 from pydantic import BaseModel, Field
@@ -82,7 +84,7 @@ CANDIDATES_AFTER_MASK = Histogram(
 CKPT_DIR = Path(os.environ.get("RECSYS_CKPT_DIR", Path.home() / "projects" / "recsys" / "checkpoints"))
 DATA_DIR = Path(os.environ.get("RECSYS_DATA_DIR", Path.home() / "projects" / "recsys" / "data" / "parquet"))
 TWO_TOWER_CKPT = CKPT_DIR / "two_tower.pt"
-RANKER_CKPT = CKPT_DIR / "ranker.lgb"
+RANKER_CKPT = Path(os.environ.get("RECSYS_RANKER_CKPT", str(CKPT_DIR / "ranker.lgb")))
 
 # serving feature log (1-in-N sampling). path is mounted as a volume in docker.
 SERVING_LOG_PATH = Path(os.environ.get("RECSYS_SERVING_LOG", "/tmp/recsys_serving.jsonl"))
@@ -92,6 +94,14 @@ SERVING_LOG_SAMPLE_RATE = float(os.environ.get("RECSYS_SERVING_LOG_RATE", "0.01"
 EXPERIMENT_NAME = os.environ.get("RECSYS_EXPERIMENT", "ranker_vs_no_ranker")
 EXPERIMENT_ENABLED = os.environ.get("RECSYS_EXPERIMENT_ENABLED", "false").lower() == "true"
 VARIANT_A_PCT = int(os.environ.get("RECSYS_VARIANT_A_PCT", "50"))
+
+# sasrec (sequential candidate generator). off by default — flip the env var on
+# once you want sasrec candidates to be unioned into the existing pipeline.
+# the ranker still gets 20 features and knows nothing about sasrec; the lift
+# comes from a richer candidate pool, not from a new feature.
+SASREC_ENABLED = os.environ.get("RECSYS_SASREC_ENABLED", "false").lower() == "true"
+SASREC_CKPT = Path(os.environ.get("RECSYS_SASREC_CKPT", str(CKPT_DIR / "sasrec_v1" / "sasrec.pt")))
+SASREC_TOP_N = int(os.environ.get("RECSYS_SASREC_TOP_N", "200"))
 
 
 def assign_variant(user_id: int) -> str:
@@ -210,11 +220,42 @@ async def lifespan(app: FastAPI):
     feature_cols = gbm.feature_name()
     log.info(f"  ranker: {len(feature_cols)} features, {gbm.num_trees()} trees")
 
+    # sasrec is optional. if disabled (default) we skip the load entirely so
+    # startup time and memory are unchanged. when enabled, load the model and
+    # keep it on the same device as two-tower so we can score on the same gpu.
+    sasrec_model = None
+    if SASREC_ENABLED:
+        log.info(f"loading sasrec from {SASREC_CKPT}")
+        if not SASREC_CKPT.exists():
+            log.error(f"sasrec checkpoint missing at {SASREC_CKPT}; serving without sasrec")
+        else:
+            s_ckpt = torch.load(SASREC_CKPT, map_location=device, weights_only=False)
+            s_cfg = s_ckpt["config"]
+            sasrec_model = SASRec(
+                vocab_size=s_cfg["vocab_size"],
+                d_model=s_cfg["d_model"],
+                n_heads=s_cfg["n_heads"],
+                n_blocks=s_cfg["n_blocks"],
+                max_seq_len=s_cfg["max_seq_len"],
+                dropout=s_cfg["dropout"],
+            ).to(device)
+            sasrec_model.load_state_dict(s_ckpt["model_state"])
+            sasrec_model.eval()
+            log.info(
+                f"  sasrec: vocab={s_cfg['vocab_size']:,} d={s_cfg['d_model']} "
+                f"blocks={s_cfg['n_blocks']} heads={s_cfg['n_heads']} "
+                f"seq_len={s_cfg['max_seq_len']}"
+            )
+    else:
+        log.info("sasrec disabled (RECSYS_SASREC_ENABLED=false)")
+
     STATE["device"] = device
     STATE["tt_model"] = tt_model
     STATE["index"] = index
     STATE["gbm"] = gbm
     STATE["feature_cols"] = feature_cols
+    STATE["sasrec_model"] = sasrec_model  # None if disabled
+    STATE["sasrec_top_n"] = SASREC_TOP_N
     STATE["user_to_idx"] = ckpt["user_to_idx"]
     STATE["movie_to_idx"] = ckpt["movie_to_idx"]
     STATE["idx_to_movie"] = {i: m for m, i in ckpt["movie_to_idx"].items()}
@@ -222,6 +263,27 @@ async def lifespan(app: FastAPI):
 
     log.info(f"models loaded in {time.time()-t0:.1f}s, now loading feature lookups")
     _load_feature_lookups()
+
+    # warm-up pass on each model to pay the mps kernel-compilation cost up
+    # front. without this the first user request takes 100+ ms instead of the
+    # steady-state ~10ms. uses a dummy tensor; no real prediction is consumed.
+    log.info("warming up models (mps kernel compilation)")
+    t_warm = time.time()
+    with torch.no_grad():
+        # two-tower: encode a single dummy user.
+        _ = tt_model.encode_user(
+            torch.zeros(1, dtype=torch.long, device=device)
+        )
+        # sasrec: forward + scoring on a single dummy sequence.
+        if sasrec_model is not None:
+            dummy = torch.zeros(
+                (1, sasrec_model.max_seq_len), dtype=torch.long, device=device
+            )
+            dummy[0, -1] = 1  # one non-pad token at the last position
+            hidden = sasrec_model(dummy)
+            _ = (hidden[:, -1, :] @ sasrec_model.item_emb.weight.T).cpu()
+    log.info(f"  warm-up: {(time.time()-t_warm)*1000:.0f}ms")
+
     log.info(f"=== startup complete in {time.time()-t0:.1f}s ===")
     yield
     log.info("=== serve.py shutting down ===")
@@ -383,9 +445,92 @@ def _load_feature_lookups():
     train_df["movie_idx"] = train_df["movie_idx"].astype(np.int32)
     STATE["train_by_user"] = train_df.groupby("user_idx")["movie_idx"].apply(set).to_dict()
 
+    # build per-user ordered history for sasrec, but only when the flag is on.
+    # matches the training-time dataset exactly: rating >= 4.0, sorted by ts,
+    # last 50 items per user, shifted by +1 to item-token space (pad = 0).
+    if STATE.get("sasrec_model") is not None:
+        t_hist = time.time()
+        log.info("building sasrec history lookup (positives only, sorted by ts)")
+        pos = train_df[train_df["rating"] >= 4.0].sort_values(
+            ["user_idx", "timestamp"], kind="stable"
+        )
+        pos["item_token"] = pos["movie_idx"].astype(np.int64) + 1
+        # last 50 per user via groupby tail; convert to plain list[int] per row
+        last50 = pos.groupby("user_idx").tail(50)
+        STATE["sasrec_history_by_user"] = (
+            last50.groupby("user_idx")["item_token"]
+            .apply(lambda s: s.tolist())
+            .to_dict()
+        )
+        n_users_with_hist = len(STATE["sasrec_history_by_user"])
+        log.info(
+            f"  sasrec history: {n_users_with_hist:,} users with >=1 positive "
+            f"({time.time()-t_hist:.1f}s)"
+        )
+    else:
+        STATE["sasrec_history_by_user"] = {}
+
     log.info(f"feature lookups loaded in {time.time()-t0:.1f}s")
     MODELS_LOADED.set(1)
 
+
+
+
+def _sasrec_last_hidden(user_idx: int) -> torch.Tensor | None:
+    """
+    compute and return the (D,) last hidden state for a user, on whatever
+    device the sasrec model lives on. None if the user has no positive
+    history. used by both _sasrec_candidates (for retrieval) and the
+    request path (to compute sasrec_score per candidate for the ranker).
+    """
+    history = STATE.get("sasrec_history_by_user", {}).get(user_idx)
+    if not history:
+        return None
+    model = STATE["sasrec_model"]
+    device = STATE["device"]
+    max_seq_len = model.max_seq_len
+    history = history[-max_seq_len:]
+    seq = np.zeros(max_seq_len, dtype=np.int64)
+    seq[max_seq_len - len(history):] = history
+    seq_t = torch.from_numpy(seq).unsqueeze(0).to(device)
+    with torch.no_grad():
+        hidden = model(seq_t)
+    return hidden[0, -1, :]  # (D,)
+
+
+def _sasrec_candidates(
+    user_idx: int, seen: set, top_n: int,
+    last_hidden: torch.Tensor | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    return (movie_idxs, scores) sasrec would have surfaced for this user.
+    movie_idxs are in two-tower / faiss space (NOT item-token space).
+    scores are the raw dot products of last hidden state and item embeddings.
+
+    if last_hidden is provided (computed once per request), we reuse it
+    instead of redoing the forward pass. saves ~2ms per request.
+
+    if the user has no positive history, returns empty arrays.
+    """
+    if last_hidden is None:
+        last_hidden = _sasrec_last_hidden(user_idx)
+        if last_hidden is None:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+
+    model = STATE["sasrec_model"]
+    with torch.no_grad():
+        scores = (last_hidden.unsqueeze(0) @ model.item_emb.weight.T).squeeze(0)  # (V,)
+
+    scores_np = scores.cpu().numpy()
+    scores_np[0] = -np.inf
+    if seen:
+        scores_np[np.fromiter(seen, dtype=np.int64) + 1] = -np.inf
+
+    top_tokens = np.argpartition(-scores_np, top_n)[:top_n]
+    top_tokens = top_tokens[np.argsort(-scores_np[top_tokens])]
+    top_movies = (top_tokens - 1).astype(np.int64)
+    top_scores = scores_np[top_tokens].astype(np.float32)
+    return top_movies, top_scores
 
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(req: RecommendRequest):
@@ -420,6 +565,40 @@ def recommend(req: RecommendRequest):
     candidates = candidates[keep]
     tt_scores = tt_scores[keep]
 
+    # sasrec candidate union, gated on the flag.
+    # this stage adds candidates only; the ranker still gets 20 features and
+    # the same tt_score per candidate. for sasrec-only items we fill tt_score
+    # with the median of the existing pool (least-bad neutral value). this is
+    # a known compromise; week 2 day 3 retrains the ranker with sasrec_score
+    # as a real 21st feature.
+    sasrec_n = 0
+    sasrec_overlap = 0
+    sasrec_added = 0
+    sasrec_last_hidden = None  # reused for scoring final candidates as 21st feature
+    t0 = time.time()
+    if SASREC_ENABLED and STATE.get("sasrec_model") is not None:
+        sasrec_last_hidden = _sasrec_last_hidden(user_idx)
+        if sasrec_last_hidden is not None:
+            s_cands, s_scores = _sasrec_candidates(
+                user_idx, seen, STATE["sasrec_top_n"],
+                last_hidden=sasrec_last_hidden,
+            )
+            sasrec_n = int(len(s_cands))
+            if sasrec_n > 0:
+                tt_set = set(int(c) for c in candidates)
+                new_mask = ~np.isin(s_cands, list(tt_set))
+                sasrec_overlap = int(sasrec_n - new_mask.sum())
+                new_cands = s_cands[new_mask]
+                sasrec_added = int(len(new_cands))
+                if sasrec_added > 0:
+                    median_tt = (
+                        float(np.median(tt_scores)) if len(tt_scores) > 0 else 0.0
+                    )
+                    filler = np.full(sasrec_added, median_tt, dtype=np.float32)
+                    candidates = np.concatenate([candidates, new_cands])
+                    tt_scores = np.concatenate([tt_scores, filler])
+    t_sasrec_ms = (time.time() - t0) * 1000
+
     if len(candidates) == 0:
         RECOMMEND_RESULTS.labels(result="no_candidates").inc()
         log.info("recommend_no_candidates", extra={"user_id": req.user_id, "seen_count": len(seen)})
@@ -435,7 +614,25 @@ def recommend(req: RecommendRequest):
     feature_cols = STATE["feature_cols"]
 
     n_cand = len(candidates)
-    feats = np.empty((n_cand, len(feature_cols)), dtype=np.float32)
+    # if the loaded ranker expects 21 features (i.e. ranker_v2), precompute
+    # sasrec_score per candidate by dotting the cached last_hidden against each
+    # candidate's item embedding. matrix op, ~0.1ms for 400 candidates.
+    n_features = len(feature_cols)
+    if n_features == 21 and sasrec_last_hidden is not None:
+        cand_tokens = torch.from_numpy(
+            candidates.astype(np.int64) + 1
+        ).to(STATE["device"])
+        with torch.no_grad():
+            cand_item_emb = STATE["sasrec_model"].item_emb.weight[cand_tokens]
+            cand_sasrec_scores = (
+                cand_item_emb @ sasrec_last_hidden
+            ).cpu().numpy().astype(np.float32)
+    else:
+        # v1 ranker, or sasrec disabled. fill with zeros; v1 ranker will ignore
+        # the 21st column because we slice rows below to match feature_cols length.
+        cand_sasrec_scores = np.zeros(n_cand, dtype=np.float32)
+
+    feats = np.empty((n_cand, 21), dtype=np.float32)
     for j, m_idx in enumerate(candidates):
         m_idx = int(m_idx)
         mf = movie_feat_dict[m_idx]
@@ -459,9 +656,13 @@ def recommend(req: RecommendRequest):
             uf["max_rating"], uf["active_seconds"], uf["pct_high"], uf["pct_low"],
             mf["num_ratings"], mf["num_unique_users"], mf["mean_rating"], mf["std_rating"],
             mf["pct_high"], mf["pct_low"], mf["smoothed_mean"],
-            ug_n, ug_total, ug_mean, ug_pct,
             tt_scores[j],
+            ug_n, ug_total, ug_mean, ug_pct,
+            cand_sasrec_scores[j],
         ]
+    # if the loaded ranker is v1 (20 features), drop the extra sasrec_score column.
+    if n_features == 20:
+        feats = feats[:, :20]
     t_features = (time.time() - t0) * 1000
 
     variant = assign_variant(req.user_id)
@@ -519,6 +720,11 @@ def recommend(req: RecommendRequest):
             "user_id": req.user_id,
             "k": req.k,
             "n_candidates": n_cand,
+            "sasrec_enabled": bool(SASREC_ENABLED),
+            "sasrec_n": sasrec_n,
+            "sasrec_overlap_with_tt": sasrec_overlap,
+            "sasrec_added": sasrec_added,
+            "sasrec_ms": round(t_sasrec_ms, 2),
             "total_ms": round(total_ms, 2),
             "encode_ms": round(t_encode, 2),
             "retrieve_ms": round(t_retrieve, 2),
